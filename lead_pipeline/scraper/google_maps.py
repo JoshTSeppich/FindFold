@@ -174,7 +174,7 @@ async def scrape(keywords: list[str], location: str, limit: int) -> list[dict]:
     queries = _build_queries(keywords, location)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, channel="chrome")
         context = await browser.new_context(
             user_agent=_USER_AGENT,
             viewport={"width": 1280, "height": 900},
