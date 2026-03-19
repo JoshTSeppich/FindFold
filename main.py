@@ -2,12 +2,15 @@
 FoxWorks Lead Pipeline — CLI entry point.
 
 Usage:
-    python main.py --keywords "plumbing,HVAC,roofing,med spa" \\
-                   --location "Utah" \\
+    python main.py --keywords "plumbing,HVAC,roofing,med spa" \
+                   --location "Utah" \
                    --limit 300
 
     # Skip Google Maps (faster, no Playwright needed):
     python main.py --keywords "plumbing,HVAC" --location "Utah" --no-maps
+
+    # Ignore cross-run dedup (clean slate):
+    python main.py --keywords "plumbing,HVAC" --location "Utah" --fresh
 
 Outputs written to ./output/:
     raw_leads.csv       — everything scraped, unfiltered
@@ -23,14 +26,17 @@ import sys
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 from rich import box
 
+load_dotenv()
+
 import config
 from lead_pipeline.scraper  import scrape_google_maps, scrape_duckduckgo
-from lead_pipeline.filter   import deduplicate, filter_leads
+from lead_pipeline.filter   import deduplicate, filter_leads, rescore_ambiguous, filter_new, save_seen
 from lead_pipeline.scanner  import fetch_many, extract
 from lead_pipeline.export   import export_apollo, export_outreach
 
@@ -53,11 +59,16 @@ logger = logging.getLogger("pipeline")
 # CSV helpers
 # ---------------------------------------------------------------------------
 
-_RAW_FIELDS = ["company_name", "website", "location", "category", "source"]
+_RAW_FIELDS = [
+    "company_name", "website", "location", "category", "source",
+    "phone", "rating", "review_count",
+]
 
 _FILTERED_FIELDS = [
     "company_name", "domain", "location", "category",
-    "icp_score", "reason_tags", "page_title", "page_description",
+    "icp_score", "claude_score", "reason_tags",
+    "phone", "email", "rating", "review_count",
+    "page_title", "page_description",
 ]
 
 
@@ -82,16 +93,20 @@ def _print_table(leads: list[dict]) -> None:
         show_header=True,
         header_style="bold cyan",
     )
-    table.add_column("Company",  max_width=36, no_wrap=True)
-    table.add_column("Domain",   max_width=28, no_wrap=True)
+    table.add_column("Company",  max_width=32, no_wrap=True)
+    table.add_column("Domain",   max_width=26, no_wrap=True)
     table.add_column("Score",    justify="right", style="bold green", width=6)
-    table.add_column("Tags",     max_width=42)
+    table.add_column("Claude",   justify="right", style="bold yellow", width=7)
+    table.add_column("Tags",     max_width=38)
 
     for lead in top:
+        claude_score = lead.get("claude_score")
+        claude_str   = f"{claude_score:.2f}" if claude_score is not None else "—"
         table.add_row(
-            lead.get("company_name", "")[:36],
-            lead.get("domain",       "")[:28],
+            lead.get("company_name", "")[:32],
+            lead.get("domain",       "")[:26],
             f"{lead.get('icp_score', 0):.2f}",
+            claude_str,
             lead.get("reason_tags",  ""),
         )
 
@@ -108,6 +123,7 @@ async def run_pipeline(
     location:  str,
     limit:     int,
     use_maps:  bool,
+    fresh:     bool,
 ) -> None:
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,7 +139,7 @@ async def run_pipeline(
         try:
             raw_leads = await scrape_google_maps(keywords, location, limit)
         except Exception as e:
-            logger.warning(f"Google Maps failed ({e}). Falling back to DuckDuckGo.")
+            logger.warning(f"Google Maps failed ({e}). Falling back to Bing.")
             raw_leads = await scrape_duckduckgo(keywords, location, limit)
     else:
         console.print("  Source: Bing search")
@@ -172,12 +188,33 @@ async def run_pipeline(
     console.rule("[bold blue]Stage 4 · ICP Scoring & Filtering")
 
     filtered = filter_leads(deduped, location, keywords)
+    console.print(
+        f"  [green]✓[/] {len(filtered)} keyword-qualified leads "
+        f"(≥{config.ICP_THRESHOLD})"
+    )
+
+    # ── Stage 4b: Claude ambiguous-zone rescoring ─────────────────────────
+    console.rule("[bold blue]Stage 4b · Claude Rescoring")
+
+    ambiguous_count = sum(
+        1 for l in filtered
+        if config.CLAUDE_AMBIGUOUS_MIN <= l.get("icp_score", 0) <= config.CLAUDE_AMBIGUOUS_MAX
+    )
+    if ambiguous_count:
+        console.print(f"  Rescoring {ambiguous_count} ambiguous leads with Claude …")
+        filtered = await rescore_ambiguous(filtered)
+        console.print(f"  [green]✓[/] {len(filtered)} leads after Claude rescoring")
+    else:
+        console.print("  No ambiguous leads — Claude rescoring skipped")
+
+    # ── Stage 4c: Cross-run domain dedup ─────────────────────────────────
+    console.rule("[bold blue]Stage 4c · Cross-Run Deduplication")
+
+    filtered, seen_dict = filter_new(filtered, fresh=fresh)
+    console.print(f"  [green]✓[/] {len(filtered)} new domains (not previously sent to Apollo)")
 
     _save_csv(filtered, config.FILTERED_OUTPUT, _FILTERED_FIELDS)
-    console.print(
-        f"  [green]✓[/] {len(filtered)} ICP-qualified leads "
-        f"(≥{config.ICP_THRESHOLD}) → [dim]{config.FILTERED_OUTPUT}[/]"
-    )
+    console.print(f"  [dim]→ {config.FILTERED_OUTPUT}[/]")
 
     # ── Stage 5: Export ───────────────────────────────────────────────────
     console.rule("[bold blue]Stage 5 · Export")
@@ -185,8 +222,12 @@ async def run_pipeline(
     apollo_n   = export_apollo(filtered,   config.APOLLO_OUTPUT)
     outreach_n = export_outreach(filtered, config.OUTREACH_OUTPUT)
 
+    # Persist seen domains after successful export
+    save_seen(seen_dict)
+
     console.print(f"  [green]✓[/] Apollo:   {apollo_n} rows → [dim]{config.APOLLO_OUTPUT}[/]")
     console.print(f"  [green]✓[/] Outreach: {outreach_n} rows → [dim]{config.OUTREACH_OUTPUT}[/]")
+    console.print(f"  [green]✓[/] Seen domains persisted ({len(seen_dict)} total)")
 
     # ── Summary ───────────────────────────────────────────────────────────
     console.rule("[bold green]Pipeline Complete")
@@ -224,13 +265,17 @@ async def run_pipeline(
 )
 @click.option(
     "--no-maps", is_flag=True, default=False,
-    help="Skip Google Maps; use DuckDuckGo only (faster, no Playwright needed).",
+    help="Skip Google Maps; use Bing only (faster, no Playwright needed).",
+)
+@click.option(
+    "--fresh", is_flag=True, default=False,
+    help="Ignore seen-domains list — re-process all leads (clean run).",
 )
 @click.option(
     "--debug", is_flag=True, default=False,
     help="Enable DEBUG-level logging.",
 )
-def main(keywords: str, location: str, limit: int, no_maps: bool, debug: bool) -> None:
+def main(keywords: str, location: str, limit: int, no_maps: bool, fresh: bool, debug: bool) -> None:
     """FoxWorks Lead Pipeline — scrape, score, and export ICP leads for Apollo."""
 
     if debug:
@@ -249,10 +294,11 @@ def main(keywords: str, location: str, limit: int, no_maps: bool, debug: bool) -
     console.print(
         f"  Source   : {'Bing only' if no_maps else 'Google Maps (Bing fallback)'}"
     )
+    console.print(f"  Fresh    : {'yes (ignoring seen domains)' if fresh else 'no'}")
     console.print(f"  Output   : {config.OUTPUT_DIR}/")
     console.print()
 
-    asyncio.run(run_pipeline(keyword_list, location, limit, use_maps=not no_maps))
+    asyncio.run(run_pipeline(keyword_list, location, limit, use_maps=not no_maps, fresh=fresh))
 
 
 if __name__ == "__main__":

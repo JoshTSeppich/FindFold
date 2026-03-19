@@ -19,3 +19,9 @@ tldextract==5.1.1
 # ── CLI & terminal output ─────────────────────────────────────────────────
 click==8.1.7
 rich==13.7.0
+
+# ── Claude API (ambiguous-zone rescoring) ─────────────────────────────────
+anthropic>=0.25.0
+
+# ── Environment variable loading ──────────────────────────────────────────
+python-dotenv>=1.0.0

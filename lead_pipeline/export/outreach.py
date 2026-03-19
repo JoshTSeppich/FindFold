@@ -14,7 +14,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_FIELDNAMES = ["company_name", "domain", "icp_score", "reason_tags"]
+_FIELDNAMES = [
+    "company_name", "domain", "icp_score", "claude_score",
+    "reason_tags", "phone", "email", "rating", "review_count",
+    "location", "category",
+]
 
 
 def export(leads: list[dict], output_path: Path) -> int:
@@ -22,7 +26,7 @@ def export(leads: list[dict], output_path: Path) -> int:
     Write outreach_ready.csv.
 
     Args:
-        leads:       filtered lead dicts (must have the four outreach fields)
+        leads:       filtered lead dicts
         output_path: destination Path
 
     Returns:
@@ -43,11 +47,19 @@ def export(leads: list[dict], output_path: Path) -> int:
             continue
         seen.add(domain)
 
+        claude_score = lead.get("claude_score")
         rows.append({
             "company_name": name,
             "domain":       domain,
             "icp_score":    round(float(lead.get("icp_score", 0.0)), 3),
+            "claude_score": round(float(claude_score), 3) if claude_score is not None else "",
             "reason_tags":  (lead.get("reason_tags") or "").strip(),
+            "phone":        (lead.get("phone") or "").strip(),
+            "email":        (lead.get("email") or "").strip(),
+            "rating":       (lead.get("rating") or "").strip(),
+            "review_count": (lead.get("review_count") or "").strip(),
+            "location":     (lead.get("location") or "").strip(),
+            "category":     (lead.get("category") or "").strip(),
         })
 
     # Best leads first

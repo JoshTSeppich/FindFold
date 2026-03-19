@@ -35,20 +35,35 @@ _USER_AGENT = (
 # JS that reads every visible card in one pass — no page interaction needed
 _EXTRACT_JS = """
 () => Array.from(document.querySelectorAll('div.Nv2PK')).map(card => {
-    const nameEl    = card.querySelector('div.qBF1Pd, span.fontHeadlineSmall');
-    const siteEl    = card.querySelector('a[data-value="Website"], a[data-item-id="authority"]');
-    const catEls    = card.querySelectorAll('div.W4Etuc, span.uEubGf');
-    const addrEl    = card.querySelector('div.UaQhfb, div.Io6YTe');
-    const ratingEl  = card.querySelector('span.MW4etd');
+    const nameEl     = card.querySelector('div.qBF1Pd, span.fontHeadlineSmall');
+    const siteEl     = card.querySelector('a[data-value="Website"], a[data-item-id="authority"]');
+    const catEls     = card.querySelectorAll('div.W4Etuc, span.uEubGf');
+    const addrEl     = card.querySelector('div.UaQhfb, div.Io6YTe');
+    const ratingEl   = card.querySelector('span.MW4etd');
+    const reviewEl   = card.querySelector('span.UY7F9');
 
-    // Website href may be a Google redirect — keep as-is, cleaned later
+    // Phone: scan aria-labels for phone hints, fallback to text pattern
+    let phone = '';
+    card.querySelectorAll('[aria-label]').forEach(el => {
+        const lbl = el.getAttribute('aria-label') || '';
+        if (/phone|call/i.test(lbl) && /\\d{3}/.test(lbl))
+            phone = lbl.replace(/[^0-9+\\-().\\s]/g, '').trim();
+    });
+    if (!phone) {
+        const m = (card.innerText || '').match(/\\(?\\d{3}\\)?[\\s.\\-]\\d{3}[\\s.\\-]\\d{4}/);
+        if (m) phone = m[0].trim();
+    }
+
     let site = siteEl ? (siteEl.href || siteEl.getAttribute('href') || '') : '';
 
     return {
-        name:     nameEl   ? nameEl.innerText.trim()    : '',
-        website:  site,
-        category: catEls.length ? catEls[0].innerText.trim() : '',
-        address:  addrEl   ? addrEl.innerText.trim()    : '',
+        name:         nameEl   ? nameEl.innerText.trim()         : '',
+        website:      site,
+        category:     catEls.length ? catEls[0].innerText.trim() : '',
+        address:      addrEl   ? addrEl.innerText.trim()         : '',
+        phone:        phone,
+        rating:       ratingEl ? ratingEl.innerText.trim()       : '',
+        review_count: reviewEl ? reviewEl.innerText.replace(/[()]/g,'').trim() : '',
     };
 }).filter(r => r.name);
 """
@@ -133,6 +148,9 @@ async def _scrape_query(page: Page, query: str, limit: int) -> list[dict]:
             "website":      website,
             "location":     item.get("address", "").strip(),
             "category":     item.get("category", "").strip(),
+            "phone":        item.get("phone", "").strip(),
+            "rating":       item.get("rating", "").strip(),
+            "review_count": item.get("review_count", "").strip(),
             "source":       "google_maps",
         })
 

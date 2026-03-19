@@ -13,6 +13,7 @@ Design:
 import asyncio
 import hashlib
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,7 @@ from config import (
     RETRY_DELAY,
     CACHE_DIR,
     CONCURRENT_REQUESTS,
+    CACHE_TTL_DAYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,12 +54,17 @@ def _cache_path(url: str) -> Path:
 
 def _read_cache(url: str) -> Optional[str]:
     p = _cache_path(url)
-    if p.exists():
-        try:
-            return p.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return None
-    return None
+    if not p.exists():
+        return None
+    # Expire stale cache entries
+    age_days = (time.time() - p.stat().st_mtime) / 86400
+    if age_days > CACHE_TTL_DAYS:
+        p.unlink(missing_ok=True)
+        return None
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
 
 
 def _write_cache(url: str, html: str) -> None:
