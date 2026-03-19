@@ -1,0 +1,259 @@
+"""
+FoxWorks Lead Pipeline — CLI entry point.
+
+Usage:
+    python main.py --keywords "plumbing,HVAC,roofing,med spa" \\
+                   --location "Utah" \\
+                   --limit 300
+
+    # Skip Google Maps (faster, no Playwright needed):
+    python main.py --keywords "plumbing,HVAC" --location "Utah" --no-maps
+
+Outputs written to ./output/:
+    raw_leads.csv       — everything scraped, unfiltered
+    filtered_leads.csv  — ICP-scored leads above threshold
+    apollo_ready.csv    — minimal 2-column CSV for Apollo bulk enrichment
+    outreach_ready.csv  — full scoring data for outreach sequences
+"""
+
+import asyncio
+import csv
+import logging
+import sys
+from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.table import Table
+from rich import box
+
+import config
+from lead_pipeline.scraper  import scrape_google_maps, scrape_duckduckgo
+from lead_pipeline.filter   import deduplicate, filter_leads
+from lead_pipeline.scanner  import fetch_many, extract
+from lead_pipeline.export   import export_apollo, export_outreach
+
+# ---------------------------------------------------------------------------
+# Console + logging
+# ---------------------------------------------------------------------------
+
+console = Console()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, show_path=False, markup=True)],
+)
+logger = logging.getLogger("pipeline")
+
+
+# ---------------------------------------------------------------------------
+# CSV helpers
+# ---------------------------------------------------------------------------
+
+_RAW_FIELDS = ["company_name", "website", "location", "category", "source"]
+
+_FILTERED_FIELDS = [
+    "company_name", "domain", "location", "category",
+    "icp_score", "reason_tags", "page_title", "page_description",
+]
+
+
+def _save_csv(rows: list[dict], path: Path, fields: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Rich summary table (top-20 leads)
+# ---------------------------------------------------------------------------
+
+def _print_table(leads: list[dict]) -> None:
+    top = sorted(leads, key=lambda x: x.get("icp_score", 0), reverse=True)[:20]
+
+    table = Table(
+        title="Top ICP Leads",
+        box=box.SIMPLE_HEAD,
+        show_header=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Company",  max_width=36, no_wrap=True)
+    table.add_column("Domain",   max_width=28, no_wrap=True)
+    table.add_column("Score",    justify="right", style="bold green", width=6)
+    table.add_column("Tags",     max_width=42)
+
+    for lead in top:
+        table.add_row(
+            lead.get("company_name", "")[:36],
+            lead.get("domain",       "")[:28],
+            f"{lead.get('icp_score', 0):.2f}",
+            lead.get("reason_tags",  ""),
+        )
+
+    console.print()
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stages
+# ---------------------------------------------------------------------------
+
+async def run_pipeline(
+    keywords:  list[str],
+    location:  str,
+    limit:     int,
+    use_maps:  bool,
+) -> None:
+
+    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Stage 1: Scrape ───────────────────────────────────────────────────
+    console.rule("[bold blue]Stage 1 · Scraping")
+
+    raw_leads: list[dict] = []
+
+    if use_maps:
+        console.print("  Source: Google Maps (Playwright)")
+        try:
+            raw_leads = await scrape_google_maps(keywords, location, limit)
+        except Exception as e:
+            logger.warning(f"Google Maps failed ({e}). Falling back to DuckDuckGo.")
+            raw_leads = await scrape_duckduckgo(keywords, location, limit)
+    else:
+        console.print("  Source: Bing search")
+        raw_leads = await scrape_duckduckgo(keywords, location, limit)
+
+    if not raw_leads:
+        console.print("[bold red]No raw leads scraped. Check your keywords/location.")
+        sys.exit(1)
+
+    _save_csv(raw_leads, config.RAW_OUTPUT, _RAW_FIELDS)
+    console.print(f"  [green]✓[/] {len(raw_leads)} raw leads → [dim]{config.RAW_OUTPUT}[/]")
+
+    # ── Stage 2: Deduplicate ──────────────────────────────────────────────
+    console.rule("[bold blue]Stage 2 · Deduplication")
+
+    deduped = deduplicate(raw_leads)
+    console.print(f"  [green]✓[/] {len(raw_leads)} → {len(deduped)} after dedup")
+
+    # ── Stage 3: Website scanning ─────────────────────────────────────────
+    console.rule("[bold blue]Stage 3 · Website Scanning")
+
+    scannable = [
+        lead["website"]
+        for lead in deduped
+        if (lead.get("website") or "").strip()
+    ]
+    console.print(
+        f"  Scanning {len(scannable)} sites "
+        f"(concurrency={config.CONCURRENT_REQUESTS}) …"
+    )
+
+    html_map = await fetch_many(scannable, concurrency=config.CONCURRENT_REQUESTS)
+
+    # Merge page data back into leads
+    scanned = 0
+    for lead in deduped:
+        url = (lead.get("website") or "").strip()
+        html = html_map.get(url)
+        if html:
+            lead.update(extract(html))
+            scanned += 1
+
+    console.print(f"  [green]✓[/] {scanned}/{len(scannable)} pages scanned")
+
+    # ── Stage 4: ICP scoring + filtering ─────────────────────────────────
+    console.rule("[bold blue]Stage 4 · ICP Scoring & Filtering")
+
+    filtered = filter_leads(deduped, location, keywords)
+
+    _save_csv(filtered, config.FILTERED_OUTPUT, _FILTERED_FIELDS)
+    console.print(
+        f"  [green]✓[/] {len(filtered)} ICP-qualified leads "
+        f"(≥{config.ICP_THRESHOLD}) → [dim]{config.FILTERED_OUTPUT}[/]"
+    )
+
+    # ── Stage 5: Export ───────────────────────────────────────────────────
+    console.rule("[bold blue]Stage 5 · Export")
+
+    apollo_n   = export_apollo(filtered,   config.APOLLO_OUTPUT)
+    outreach_n = export_outreach(filtered, config.OUTREACH_OUTPUT)
+
+    console.print(f"  [green]✓[/] Apollo:   {apollo_n} rows → [dim]{config.APOLLO_OUTPUT}[/]")
+    console.print(f"  [green]✓[/] Outreach: {outreach_n} rows → [dim]{config.OUTREACH_OUTPUT}[/]")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    console.rule("[bold green]Pipeline Complete")
+
+    _print_table(filtered)
+
+    console.print()
+    console.print(f"  Raw scraped:    [bold]{len(raw_leads)}[/]")
+    console.print(f"  After dedup:    [bold]{len(deduped)}[/]")
+    console.print(f"  Pages scanned:  [bold]{scanned}[/]")
+    console.print(f"  ICP qualified:  [bold cyan]{len(filtered)}[/]")
+
+    if raw_leads:
+        ratio = len(raw_leads) / max(len(filtered), 1)
+        console.print(f"  Filter ratio:   [bold]{ratio:.1f}x[/] (raw → qualified)")
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+@click.command()
+@click.option(
+    "--keywords", required=True,
+    help='Comma-separated ICP keywords. E.g. "plumbing,HVAC,roofing,med spa"',
+)
+@click.option(
+    "--location", required=True,
+    help='Target market. E.g. "Utah" or "Salt Lake City Utah"',
+)
+@click.option(
+    "--limit", default=300, show_default=True,
+    help="Max raw leads to scrape before filtering.",
+)
+@click.option(
+    "--no-maps", is_flag=True, default=False,
+    help="Skip Google Maps; use DuckDuckGo only (faster, no Playwright needed).",
+)
+@click.option(
+    "--debug", is_flag=True, default=False,
+    help="Enable DEBUG-level logging.",
+)
+def main(keywords: str, location: str, limit: int, no_maps: bool, debug: bool) -> None:
+    """FoxWorks Lead Pipeline — scrape, score, and export ICP leads for Apollo."""
+
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    keyword_list = [k.strip() for k in keywords.split(",") if k.strip()]
+    if not keyword_list:
+        console.print("[red]Error: at least one keyword is required.")
+        sys.exit(1)
+
+    console.print()
+    console.print("[bold cyan]FoxWorks Lead Pipeline[/]")
+    console.print(f"  Keywords : {keyword_list}")
+    console.print(f"  Location : {location}")
+    console.print(f"  Limit    : {limit} raw leads")
+    console.print(
+        f"  Source   : {'Bing only' if no_maps else 'Google Maps (Bing fallback)'}"
+    )
+    console.print(f"  Output   : {config.OUTPUT_DIR}/")
+    console.print()
+
+    asyncio.run(run_pipeline(keyword_list, location, limit, use_maps=not no_maps))
+
+
+if __name__ == "__main__":
+    main()

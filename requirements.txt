@@ -1,0 +1,21 @@
+# FoxWorks Lead Pipeline — Python dependencies
+# Install with: pip install -r requirements.txt
+# Then: playwright install chromium
+
+# ── Async HTTP ────────────────────────────────────────────────────────────
+aiohttp==3.9.1
+aiofiles==23.2.1
+
+# ── Browser automation (Google Maps scraper) ─────────────────────────────
+playwright==1.40.0
+
+# ── HTML parsing ─────────────────────────────────────────────────────────
+beautifulsoup4==4.12.2
+lxml==4.9.4
+
+# ── Domain extraction ────────────────────────────────────────────────────
+tldextract==5.1.1
+
+# ── CLI & terminal output ─────────────────────────────────────────────────
+click==8.1.7
+rich==13.7.0
