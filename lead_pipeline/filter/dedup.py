@@ -5,14 +5,24 @@ Normalizes raw URLs to bare domains, then keeps the most complete
 record for each domain. Leads without a website are grouped by
 lowercased company name to avoid silently discarding them before
 the ICP scorer has a chance to drop them explicitly.
+
+When merging duplicates, the version WITH a website always beats
+the version without, regardless of other field completeness.
 """
 
 import logging
+import re
 from typing import Optional
 
 import tldextract
 
 logger = logging.getLogger(__name__)
+
+# Strip common legal suffixes before name-based dedup
+_LEGAL_SUFFIX_RE = re.compile(
+    r"\s*(,?\s*(llc|inc|corp|co|ltd|lp|plc|pllc|dba|s\.a\.|p\.a\.)\.?\s*$)",
+    re.IGNORECASE,
+)
 
 
 def normalize_domain(url: str) -> str:
@@ -41,10 +51,23 @@ def normalize_domain(url: str) -> str:
     return f"{ext.domain}.{ext.suffix}".lower()
 
 
+def _normalize_name(name: str) -> str:
+    """Strip legal suffixes and extra whitespace for company-name dedup."""
+    return _LEGAL_SUFFIX_RE.sub("", name).strip().lower()
+
+
 def _completeness(lead: dict) -> int:
-    """Score a lead by number of non-empty fields (higher = keep this one)."""
-    fields = ["company_name", "website", "location", "category"]
-    return sum(1 for f in fields if str(lead.get(f, "")).strip())
+    """
+    Score a lead by populated fields. Website presence gets extra weight
+    so the version with a website always wins when merging duplicates.
+    """
+    score = 0
+    if str(lead.get("website", "")).strip():
+        score += 10   # heavy bonus — website is the most valuable field
+    for f in ("location", "category", "company_name", "phone", "rating"):
+        if str(lead.get(f, "")).strip():
+            score += 1
+    return score
 
 
 def deduplicate(leads: list[dict]) -> list[dict]:
@@ -53,7 +76,7 @@ def deduplicate(leads: list[dict]) -> list[dict]:
 
     Deduplication key:
       - Leads WITH a website  → normalized domain
-      - Leads WITHOUT website → "__nosite__" + lowercased company name
+      - Leads WITHOUT website → "__nosite__" + normalized company name
 
     Returns deduplicated list preserving insertion order of first-seen keys.
     """
@@ -66,12 +89,13 @@ def deduplicate(leads: list[dict]) -> list[dict]:
         if domain:
             key = domain
         else:
-            name = str(lead.get("company_name", "")).lower().strip()
+            name = _normalize_name(str(lead.get("company_name", "")))
             key  = f"__nosite__{name}"
 
         if key not in by_key:
             by_key[key] = lead
         else:
+            # Prefer the lead with higher completeness (website presence wins)
             if _completeness(lead) > _completeness(by_key[key]):
                 by_key[key] = lead
 

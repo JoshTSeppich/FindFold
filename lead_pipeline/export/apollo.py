@@ -4,7 +4,7 @@ Apollo enrichment CSV exporter.
 Produces the minimal two-column CSV that Apollo's bulk upload expects:
     company_name, domain
 
-One row per unique domain, alphabetically sorted, clean formatting.
+One row per unique domain, sorted by ICP score descending (best leads first).
 No extra columns — Apollo rejects files with unexpected headers.
 """
 
@@ -35,7 +35,7 @@ def export(leads: list[dict], output_path: Path) -> int:
     rows: list[dict] = []
     seen:  set[str]  = set()
 
-    for lead in leads:
+    for lead in sorted(leads, key=lambda l: l.get("icp_score", 0), reverse=True):
         domain = (lead.get("domain") or "").strip().lower()
         name   = (lead.get("company_name") or "").strip()
 
@@ -44,9 +44,6 @@ def export(leads: list[dict], output_path: Path) -> int:
         seen.add(domain)
 
         rows.append({"company_name": name, "domain": domain})
-
-    # Alphabetical by company name for human readability
-    rows.sort(key=lambda r: r["company_name"].lower())
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as f:

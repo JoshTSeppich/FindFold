@@ -5,14 +5,16 @@ Design:
   - aiohttp for async HTTP (fast, non-blocking)
   - asyncio.Semaphore to cap concurrent connections
   - Simple MD5-keyed file cache to avoid re-fetching across runs
-  - Exponential backoff on transient failures
-  - SSL verification disabled for small business sites
-    (many have expired or misconfigured certificates)
+  - Immediate first retry on transient failures, then exponential backoff
+  - SSL: attempts with verification first; retries without on SSLError only
+    (many small business sites have expired/misconfigured certificates)
+  - TCPConnector limit matches semaphore concurrency (no wasted FDs)
 """
 
 import asyncio
 import hashlib
 import logging
+import ssl
 import time
 from pathlib import Path
 from typing import Optional
@@ -56,10 +58,12 @@ def _read_cache(url: str) -> Optional[str]:
     p = _cache_path(url)
     if not p.exists():
         return None
-    # Expire stale cache entries
     age_days = (time.time() - p.stat().st_mtime) / 86400
     if age_days > CACHE_TTL_DAYS:
-        p.unlink(missing_ok=True)
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass   # already removed by concurrent process
         return None
     try:
         return p.read_text(encoding="utf-8", errors="ignore")
@@ -89,8 +93,10 @@ async def fetch_html(
 
     Returns the HTML string, or None if all attempts fail.
     Caches successful responses to disk.
+
+    SSL strategy: try with verification; on SSLError retry without.
+    4xx responses are not retried (permanent failures).
     """
-    # Normalise scheme
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
@@ -100,15 +106,22 @@ async def fetch_html(
             logger.debug(f"[scanner] cache hit: {url}")
             return cached
 
+    ssl_ctx: object = ssl.create_default_context()
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with session.get(
                 url,
                 headers=_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(
+                    total=REQUEST_TIMEOUT,
+                    sock_connect=10,
+                    sock_read=REQUEST_TIMEOUT,
+                ),
                 allow_redirects=True,
-                ssl=False,
+                ssl=ssl_ctx,
             ) as resp:
+                # 4xx = permanent failure, don't retry
                 if resp.status >= 400:
                     logger.debug(f"[scanner] HTTP {resp.status}: {url}")
                     return None
@@ -120,6 +133,12 @@ async def fetch_html(
 
                 return html
 
+        except aiohttp.ClientConnectorCertificateError:
+            # SSL cert problem — retry immediately without verification
+            if ssl_ctx is not False:
+                logger.debug(f"[scanner] SSL error, retrying without verify: {url}")
+                ssl_ctx = False
+                continue   # don't count as an attempt
         except asyncio.TimeoutError:
             logger.debug(f"[scanner] timeout (attempt {attempt}): {url}")
         except aiohttp.ClientConnectorError as e:
@@ -130,7 +149,9 @@ async def fetch_html(
             logger.debug(f"[scanner] unexpected (attempt {attempt}): {url} — {e}")
 
         if attempt < MAX_RETRIES:
-            await asyncio.sleep(RETRY_DELAY * attempt)
+            # Immediate first retry; exponential backoff after that
+            if attempt > 1:
+                await asyncio.sleep(RETRY_DELAY * (2 ** (attempt - 2)))
 
     logger.debug(f"[scanner] gave up: {url}")
     return None
@@ -154,7 +175,8 @@ async def fetch_many(
     results: dict[str, Optional[str]] = {}
     semaphore = asyncio.Semaphore(concurrency)
 
-    connector = aiohttp.TCPConnector(ssl=False, limit=concurrency + 5)
+    # Match connector limit to semaphore — no wasted file descriptors
+    connector = aiohttp.TCPConnector(limit=concurrency)
     async with aiohttp.ClientSession(connector=connector) as session:
 
         async def _one(url: str) -> None:

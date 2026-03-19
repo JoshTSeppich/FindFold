@@ -6,11 +6,20 @@ Usage:
                    --location "Utah" \
                    --limit 300
 
+    # Multiple cities (parallel scraping):
+    python main.py --keywords "HVAC,roofing,med spa" \
+                   --cities "Salt Lake City Utah,Provo Utah,Ogden Utah" \
+                   --limit 100
+
     # Skip Google Maps (faster, no Playwright needed):
     python main.py --keywords "plumbing,HVAC" --location "Utah" --no-maps
 
-    # Ignore cross-run dedup (clean slate):
+    # Clean run — ignore cross-run dedup:
     python main.py --keywords "plumbing,HVAC" --location "Utah" --fresh
+
+    # Re-process domains seen more than 90 days ago:
+    python main.py --keywords "plumbing,HVAC" --location "Utah" \
+                   --unseen-older-than 90
 
 Outputs written to ./output/:
     raw_leads.csv       — everything scraped, unfiltered
@@ -115,15 +124,35 @@ def _print_table(leads: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Scraping — supports multiple cities
+# ---------------------------------------------------------------------------
+
+async def _scrape_city(
+    keywords: list[str],
+    location: str,
+    limit: int,
+    use_maps: bool,
+) -> list[dict]:
+    """Scrape one city. Falls back to Bing if Maps fails."""
+    if use_maps:
+        try:
+            return await scrape_google_maps(keywords, location, limit)
+        except Exception as e:
+            logger.warning(f"[{location}] Maps failed ({e}). Falling back to Bing.")
+    return await scrape_duckduckgo(keywords, location, limit)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
 async def run_pipeline(
-    keywords:  list[str],
-    location:  str,
-    limit:     int,
-    use_maps:  bool,
-    fresh:     bool,
+    keywords:           list[str],
+    locations:          list[str],
+    limit:              int,
+    use_maps:           bool,
+    fresh:              bool,
+    unseen_older_than:  int,
 ) -> None:
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,18 +161,21 @@ async def run_pipeline(
     # ── Stage 1: Scrape ───────────────────────────────────────────────────
     console.rule("[bold blue]Stage 1 · Scraping")
 
-    raw_leads: list[dict] = []
+    per_city_limit = max(1, limit // len(locations))
+    src_label = "Bing only" if not use_maps else "Google Maps (Bing fallback)"
+    console.print(
+        f"  Source   : {src_label}\n"
+        f"  Cities   : {len(locations)}\n"
+        f"  Per-city : {per_city_limit} raw leads"
+    )
 
-    if use_maps:
-        console.print("  Source: Google Maps (Playwright)")
-        try:
-            raw_leads = await scrape_google_maps(keywords, location, limit)
-        except Exception as e:
-            logger.warning(f"Google Maps failed ({e}). Falling back to Bing.")
-            raw_leads = await scrape_duckduckgo(keywords, location, limit)
-    else:
-        console.print("  Source: Bing search")
-        raw_leads = await scrape_duckduckgo(keywords, location, limit)
+    # Cities run sequentially to avoid Google Maps rate-limiting from
+    # multiple parallel Playwright browser instances on the same machine.
+    # Bing/no-maps mode can be parallelised safely if needed.
+    raw_leads: list[dict] = []
+    for loc in locations:
+        batch = await _scrape_city(keywords, loc, per_city_limit, use_maps)
+        raw_leads.extend(batch)
 
     if not raw_leads:
         console.print("[bold red]No raw leads scraped. Check your keywords/location.")
@@ -173,7 +205,6 @@ async def run_pipeline(
 
     html_map = await fetch_many(scannable, concurrency=config.CONCURRENT_REQUESTS)
 
-    # Merge page data back into leads
     scanned = 0
     for lead in deduped:
         url = (lead.get("website") or "").strip()
@@ -187,7 +218,16 @@ async def run_pipeline(
     # ── Stage 4: ICP scoring + filtering ─────────────────────────────────
     console.rule("[bold blue]Stage 4 · ICP Scoring & Filtering")
 
-    filtered = filter_leads(deduped, location, keywords)
+    # Use the shared geographic term across all locations for scoring
+    # e.g. ["Salt Lake City Utah", "Provo Utah"] → "Utah"
+    if len(locations) == 1:
+        score_location = locations[0]
+    else:
+        words_sets = [set(loc.split()) for loc in locations]
+        common = words_sets[0].intersection(*words_sets[1:])
+        score_location = " ".join(w for w in locations[0].split() if w in common) or locations[0]
+
+    filtered = filter_leads(deduped, score_location, keywords)
     console.print(
         f"  [green]✓[/] {len(filtered)} keyword-qualified leads "
         f"(≥{config.ICP_THRESHOLD})"
@@ -210,7 +250,11 @@ async def run_pipeline(
     # ── Stage 4c: Cross-run domain dedup ─────────────────────────────────
     console.rule("[bold blue]Stage 4c · Cross-Run Deduplication")
 
-    filtered, seen_dict = filter_new(filtered, fresh=fresh)
+    filtered, seen_dict = filter_new(
+        filtered,
+        fresh=fresh,
+        unseen_older_than=unseen_older_than,
+    )
     console.print(f"  [green]✓[/] {len(filtered)} new domains (not previously sent to Apollo)")
 
     _save_csv(filtered, config.FILTERED_OUTPUT, _FILTERED_FIELDS)
@@ -222,12 +266,19 @@ async def run_pipeline(
     apollo_n   = export_apollo(filtered,   config.APOLLO_OUTPUT)
     outreach_n = export_outreach(filtered, config.OUTREACH_OUTPUT)
 
-    # Persist seen domains after successful export
-    save_seen(seen_dict)
+    # Save seen domains ONLY after both exports succeed.
+    # This prevents leads from being permanently skipped if an export fails.
+    if apollo_n > 0 and outreach_n > 0:
+        save_seen(seen_dict)
+        console.print(f"  [green]✓[/] Seen domains persisted ({len(seen_dict)} total)")
+    elif filtered:
+        console.print(
+            "[yellow]  ⚠ Export produced 0 rows — seen domains NOT saved "
+            "(leads will be re-processed next run)[/]"
+        )
 
     console.print(f"  [green]✓[/] Apollo:   {apollo_n} rows → [dim]{config.APOLLO_OUTPUT}[/]")
     console.print(f"  [green]✓[/] Outreach: {outreach_n} rows → [dim]{config.OUTREACH_OUTPUT}[/]")
-    console.print(f"  [green]✓[/] Seen domains persisted ({len(seen_dict)} total)")
 
     # ── Summary ───────────────────────────────────────────────────────────
     console.rule("[bold green]Pipeline Complete")
@@ -240,8 +291,8 @@ async def run_pipeline(
     console.print(f"  Pages scanned:  [bold]{scanned}[/]")
     console.print(f"  ICP qualified:  [bold cyan]{len(filtered)}[/]")
 
-    if raw_leads:
-        ratio = len(raw_leads) / max(len(filtered), 1)
+    if filtered:
+        ratio = len(raw_leads) / len(filtered)
         console.print(f"  Filter ratio:   [bold]{ratio:.1f}x[/] (raw → qualified)")
     console.print()
 
@@ -256,12 +307,16 @@ async def run_pipeline(
     help='Comma-separated ICP keywords. E.g. "plumbing,HVAC,roofing,med spa"',
 )
 @click.option(
-    "--location", required=True,
-    help='Target market. E.g. "Utah" or "Salt Lake City Utah"',
+    "--location", default="",
+    help='Single target market. E.g. "Salt Lake City Utah". Ignored if --cities is set.',
+)
+@click.option(
+    "--cities", default="",
+    help='Comma-separated cities to scrape. E.g. "Salt Lake City Utah,Provo Utah"',
 )
 @click.option(
     "--limit", default=300, show_default=True,
-    help="Max raw leads to scrape before filtering.",
+    help="Max raw leads to scrape (split evenly across cities).",
 )
 @click.option(
     "--no-maps", is_flag=True, default=False,
@@ -272,10 +327,23 @@ async def run_pipeline(
     help="Ignore seen-domains list — re-process all leads (clean run).",
 )
 @click.option(
+    "--unseen-older-than", "unseen_older_than", default=0, show_default=True,
+    help="Re-process domains first seen more than N days ago (0 = never expire).",
+)
+@click.option(
     "--debug", is_flag=True, default=False,
     help="Enable DEBUG-level logging.",
 )
-def main(keywords: str, location: str, limit: int, no_maps: bool, fresh: bool, debug: bool) -> None:
+def main(
+    keywords: str,
+    location: str,
+    cities: str,
+    limit: int,
+    no_maps: bool,
+    fresh: bool,
+    unseen_older_than: int,
+    debug: bool,
+) -> None:
     """FoxWorks Lead Pipeline — scrape, score, and export ICP leads for Apollo."""
 
     if debug:
@@ -286,19 +354,37 @@ def main(keywords: str, location: str, limit: int, no_maps: bool, fresh: bool, d
         console.print("[red]Error: at least one keyword is required.")
         sys.exit(1)
 
+    # --cities takes precedence over --location
+    if cities:
+        location_list = [c.strip() for c in cities.split(",") if c.strip()]
+    elif location:
+        location_list = [location.strip()]
+    else:
+        console.print("[red]Error: provide --location or --cities.")
+        sys.exit(1)
+
     console.print()
     console.print("[bold cyan]FoxWorks Lead Pipeline[/]")
     console.print(f"  Keywords : {keyword_list}")
-    console.print(f"  Location : {location}")
-    console.print(f"  Limit    : {limit} raw leads")
+    console.print(f"  Cities   : {location_list}")
+    console.print(f"  Limit    : {limit} raw leads total")
     console.print(
         f"  Source   : {'Bing only' if no_maps else 'Google Maps (Bing fallback)'}"
     )
     console.print(f"  Fresh    : {'yes (ignoring seen domains)' if fresh else 'no'}")
+    if unseen_older_than:
+        console.print(f"  Expiry   : re-process domains older than {unseen_older_than} days")
     console.print(f"  Output   : {config.OUTPUT_DIR}/")
     console.print()
 
-    asyncio.run(run_pipeline(keyword_list, location, limit, use_maps=not no_maps, fresh=fresh))
+    asyncio.run(run_pipeline(
+        keywords          = keyword_list,
+        locations         = location_list,
+        limit             = limit,
+        use_maps          = not no_maps,
+        fresh             = fresh,
+        unseen_older_than = unseen_older_than,
+    ))
 
 
 if __name__ == "__main__":

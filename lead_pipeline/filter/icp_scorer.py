@@ -46,6 +46,21 @@ logger = logging.getLogger(__name__)
 
 _PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
 
+# Pre-compiled word-boundary patterns for location matching
+_LOCATION_RE_CACHE: dict[str, re.Pattern] = {}
+
+# Rating/review: extract first decimal number from strings like "4.5" or "4 (1,234)"
+_RATING_RE  = re.compile(r"(\d+\.?\d*)")
+_REVIEW_RE  = re.compile(r"([\d,]+)")
+
+
+def _location_re(location: str) -> re.Pattern:
+    if location not in _LOCATION_RE_CACHE:
+        _LOCATION_RE_CACHE[location] = re.compile(
+            r"\b" + re.escape(location) + r"\b", re.IGNORECASE
+        )
+    return _LOCATION_RE_CACHE[location]
+
 
 def _combined_text(lead: dict) -> str:
     parts = [
@@ -76,15 +91,42 @@ def _is_franchise(domain: str, text: str) -> bool:
 
 
 def _detect_industry(text: str, input_keywords: list[str]) -> Optional[str]:
+    """
+    Return the best-matching industry label or None.
+    Checks user-supplied keywords first, then scans all industry phrase lists.
+    """
+    # Check if any user keyword directly matches an industry phrase list
     for kw in input_keywords:
-        if kw.lower() in text:
-            for industry, phrases in INDUSTRY_KEYWORDS.items():
-                if any(p in kw.lower() for p in phrases):
-                    return industry
+        kw_lower = kw.lower()
+        for industry, phrases in INDUSTRY_KEYWORDS.items():
+            if any(p == kw_lower or kw_lower in p or p in kw_lower for p in phrases):
+                return industry
+    # Fallback: scan combined text for any industry phrase
     for industry, phrases in INDUSTRY_KEYWORDS.items():
         if any(p in text for p in phrases):
             return industry
     return None
+
+
+def _parse_rating(rating_str: str) -> Optional[float]:
+    """Parse rating from strings like '4.5', '4 (1,234 reviews)', '★★★★☆ 4.5'."""
+    if not rating_str:
+        return None
+    m = _RATING_RE.search(rating_str)
+    return float(m.group(1)) if m else None
+
+
+def _parse_review_count(review_str: str) -> int:
+    """Parse review count from strings like '(42)', '1,234', '42K'."""
+    if not review_str:
+        return 0
+    # Handle 'K' suffix: "2K" → 2000
+    review_str = review_str.strip().upper()
+    if review_str.endswith("K"):
+        m = _RATING_RE.search(review_str)
+        return int(float(m.group(1)) * 1000) if m else 0
+    m = _REVIEW_RE.search(review_str)
+    return int(m.group(1).replace(",", "")) if m else 0
 
 
 def score_lead(
@@ -101,7 +143,7 @@ def score_lead(
     score  = 0.0
     tags:  list[str] = []
 
-    # ── Negative signals ────────────────────────────────────────────────────
+    # ── Negative signals (applied first; franchise is a hard kill) ──────────
 
     if _is_franchise(domain, text):
         score += SCORE_WEIGHTS["franchise"]
@@ -120,6 +162,10 @@ def score_lead(
         score += SCORE_WEIGHTS["careers_heavy"]
         tags.append("careers_heavy")
 
+    # Early exit: if score is already disqualifying, skip positive signals
+    if score <= -0.70:
+        return round(max(0.0, min(1.0, score)), 3), tags
+
     # ── Positive signals ─────────────────────────────────────────────────────
 
     if domain:
@@ -131,13 +177,17 @@ def score_lead(
         score += SCORE_WEIGHTS["keyword_match"]
         tags.append(f"industry:{industry}")
 
-    if location.lower() in text:
+    # Word-boundary location match (prevents "Utahans", "Utahorum", etc.)
+    if _location_re(location).search(text):
         score += SCORE_WEIGHTS["location_match"]
         tags.append("location_match")
 
-    has_phone   = bool(_PHONE_RE.search(text)) or bool(lead.get("phone"))
-    has_contact = _any_match(text, ["contact", "call us", "email us", "get in touch", "contact us"])
-    has_form    = lead.get("has_form", False)
+    has_phone = bool(_PHONE_RE.search(text)) or bool(lead.get("phone"))
+    has_contact = _any_match(text, [
+        "contact", "call us", "email us", "get in touch", "contact us",
+        "live chat", "whatsapp", "contact form",
+    ])
+    has_form = lead.get("has_form", False)
     if has_phone or has_contact or has_form:
         score += SCORE_WEIGHTS["has_contact_indicators"]
         tags.append("has_contact")
@@ -151,14 +201,14 @@ def score_lead(
         tags.append("trust_signals")
 
     # Reviews from Maps — differentiates within the top band
-    rating       = lead.get("rating", "").strip()
-    review_count = lead.get("review_count", "").strip()
-    try:
-        if rating and float(rating) >= 4.0 and int(review_count or "0") >= 10:
-            score += 0.05
-            tags.append(f"rated:{rating}({review_count})")
-    except (ValueError, TypeError):
-        pass
+    rating_str   = str(lead.get("rating", "")).strip()
+    review_str   = str(lead.get("review_count", "")).strip()
+    rating_val   = _parse_rating(rating_str)
+    review_count = _parse_review_count(review_str)
+
+    if rating_val is not None and rating_val >= 4.0 and review_count >= 10:
+        score += 0.05
+        tags.append(f"rated:{rating_val:.1f}({review_count})")
 
     score = round(max(0.0, min(1.0, score)), 3)
     return score, tags
@@ -186,9 +236,10 @@ def filter_leads(
 
         score, tags = score_lead(lead, location, input_keywords)
 
-        lead["domain"]      = domain
-        lead["icp_score"]   = score
-        lead["reason_tags"] = "|".join(tags)
+        lead["domain"]       = domain
+        lead["icp_score"]    = score
+        lead["claude_score"] = None   # populated later if Claude rescores
+        lead["reason_tags"]  = "|".join(tags)
 
         if score >= ICP_THRESHOLD:
             passed.append(lead)

@@ -9,8 +9,8 @@ Output fields merged into each lead dict:
   page_description  — meta description or og:description content
   page_text         — first MAX_TEXT_CHARS of visible body text
   has_phone         — True if a US phone number pattern is detected
-  has_form          — True if a <form> or text/email/tel input exists
-  email             — first email address found on the page (or "")
+  has_form          — True if a contact-oriented <form> exists
+  email             — first business email found on the page (or "")
 """
 
 import re
@@ -30,18 +30,38 @@ MAX_TEXT_CHARS = 3_000
 _PHONE_RE = re.compile(
     r"\b(?:\+?1[-.\s]?)?\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})\b"
 )
-_INPUT_RE = re.compile(
-    r'<input[^>]+type=["\']?\s*(?:text|email|tel)\s*["\']?',
+
+# Contact-intent form: must have email/tel/text input (not just a search box)
+_CONTACT_INPUT_RE = re.compile(
+    r'<input[^>]+type=["\']?\s*(?:email|tel)\s*["\']?',
     re.IGNORECASE,
 )
-# Captures standard email addresses; avoids image filenames / version strings
+
+# Standard email pattern; avoids image filenames and version strings
 _EMAIL_RE = re.compile(
     r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
 )
-_EMAIL_JUNK = re.compile(
-    r"@(sentry\.|example\.|test\.|wix\.|squarespace\.|wordpress\.|google\.|adobe\.)",
+
+# Domains whose email addresses should be treated as junk
+_EMAIL_JUNK_RE = re.compile(
+    r"@(?:"
+    r"sentry\.|example\.|test\.|wix\.|squarespace\.|wordpress\.|"
+    r"google\.|adobe\.|cloudflare\.|mailchimp\.|hubspot\.|"
+    r"zendesk\.|intercom\.|freshdesk\.|drift\."
+    r")",
     re.I,
 )
+
+# noreply / system email prefixes to skip
+_NOREPLY_RE = re.compile(
+    r"^(?:no-?reply|bounce|mailer-daemon|postmaster|alerts?|notifications?|"
+    r"do-not-reply|donotreply|noreply|system|auto|daemon)@",
+    re.I,
+)
+
+
+def _is_junk_email(candidate: str) -> bool:
+    return bool(_EMAIL_JUNK_RE.search(candidate)) or bool(_NOREPLY_RE.match(candidate))
 
 
 def extract(html: str) -> dict:
@@ -54,9 +74,12 @@ def extract(html: str) -> dict:
 
     try:
         soup = BeautifulSoup(html, "lxml")
-    except Exception as e:
-        logger.debug(f"[extractor] parse error: {e}")
-        return _empty()
+    except Exception:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception as e:
+            logger.debug(f"[extractor] parse error: {e}")
+            return _empty()
 
     # ---- Title ----
     title_tag  = soup.find("title")
@@ -66,7 +89,6 @@ def extract(html: str) -> dict:
     desc_tag = (
         soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
         or soup.find("meta", attrs={"property": "og:description"})
-        or soup.find("meta", attrs={"name": re.compile(r"og:description", re.I)})
     )
     page_description = ""
     if desc_tag and isinstance(desc_tag, Tag):
@@ -76,15 +98,15 @@ def extract(html: str) -> dict:
     email = ""
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if href.startswith("mailto:"):
+        if href.lower().startswith("mailto:"):
             candidate = href[7:].split("?")[0].strip().lower()
-            if candidate and not _EMAIL_JUNK.search(candidate):
+            if candidate and not _is_junk_email(candidate):
                 email = candidate
                 break
     if not email:
         for m in _EMAIL_RE.finditer(html):
             candidate = m.group(0).lower()
-            if not _EMAIL_JUNK.search(candidate):
+            if not _is_junk_email(candidate):
                 email = candidate
                 break
 
@@ -93,11 +115,18 @@ def extract(html: str) -> dict:
         tag.decompose()
 
     body     = soup.find("body")
-    raw_text = body.get_text(separator=" ", strip=True) if body else soup.get_text(separator=" ", strip=True)
+    raw_text = (
+        body.get_text(separator=" ", strip=True)
+        if body
+        else soup.get_text(separator=" ", strip=True)
+    )
     page_text = re.sub(r"\s{2,}", " ", raw_text)[:MAX_TEXT_CHARS]
 
     has_phone = bool(_PHONE_RE.search(raw_text))
-    has_form  = bool(soup.find("form")) or bool(_INPUT_RE.search(html))
+
+    # Form detection: require contact-oriented inputs (email or tel),
+    # not just any form (search boxes, newsletter, etc.)
+    has_form = bool(_CONTACT_INPUT_RE.search(html))
 
     return {
         "page_title":       page_title,
