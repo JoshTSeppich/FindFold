@@ -1,5 +1,7 @@
 # FindFold
 
+Why I built this: I needed a steady list of local service businesses that fit Foxworks, without scoring every lead with a model or paying to enrich the same company twice.
+
 FindFold is a command-line pipeline I built to find local service businesses that fit the FoxWorks.dev customer profile. It scrapes Google Maps or Bing for a set of keywords and cities, fetches each company's homepage, scores it against the profile with keyword rules, sends only the ambiguous cases to Claude for a second opinion, and writes CSVs ready for Apollo enrichment and outreach. It remembers domains it has already processed so a business is never enriched twice.
 
 ## Status
