@@ -1,20 +1,11 @@
 """
-Google Maps scraper — list view mode (no per-card clicking).
+Scrape Google Maps results from the list view.
 
-Strategy:
-  1. Navigate to maps.google.com/search/{query}
-  2. Scroll the results sidebar to lazy-load all cards
-  3. Extract ALL card data in one JS evaluate() call — no clicking, no waiting
-  4. Repeat for each keyword/location query combination
-
-Why no clicking: clicking each card + waiting for the detail panel + going back
-costs ~3 seconds per card. For 500 leads that's 25+ minutes. List view
-extraction takes milliseconds regardless of result count.
-
-Trade-off: website URLs are not always visible in the list view. When missing,
-the lead is kept with an empty website field — the filter stage will drop it
-(hard rule: no domain → dropped). In practice Google Maps shows a website
-link inline for ~60-70% of results, which is sufficient volume.
+I read every card in the sidebar with one page.evaluate call instead of
+clicking into each one. Clicking costs about three seconds per card, which is
+25 minutes for 500 leads. The list view gives me everything in milliseconds.
+The cost is that the website link is only shown inline for roughly two thirds
+of results. A lead with no website is kept here and dropped by the scorer.
 """
 
 import asyncio
@@ -22,27 +13,27 @@ import logging
 import re
 from urllib.parse import quote
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import Page, async_playwright
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = (
+USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/121.0.0.0 Safari/537.36"
 )
 
-# JS that reads every visible card in one pass — no page interaction needed
-_EXTRACT_JS = """
+# Reads every card on the page. The class names are Google's and change
+# without notice, so this is the first place to look when results dry up.
+EXTRACT_JS = """
 () => Array.from(document.querySelectorAll('div.Nv2PK')).map(card => {
-    const nameEl     = card.querySelector('div.qBF1Pd, span.fontHeadlineSmall');
-    const siteEl     = card.querySelector('a[data-value="Website"], a[data-item-id="authority"]');
-    const catEls     = card.querySelectorAll('div.W4Etuc, span.uEubGf');
-    const addrEl     = card.querySelector('div.UaQhfb, div.Io6YTe');
-    const ratingEl   = card.querySelector('span.MW4etd');
-    const reviewEl   = card.querySelector('span.UY7F9');
+    const nameEl   = card.querySelector('div.qBF1Pd, span.fontHeadlineSmall');
+    const siteEl   = card.querySelector('a[data-value="Website"], a[data-item-id="authority"]');
+    const catEls   = card.querySelectorAll('div.W4Etuc, span.uEubGf');
+    const addrEl   = card.querySelector('div.UaQhfb, div.Io6YTe');
+    const ratingEl = card.querySelector('span.MW4etd');
+    const reviewEl = card.querySelector('span.UY7F9');
 
-    // Phone: scan aria-labels for phone hints, fallback to text pattern
     let phone = '';
     card.querySelectorAll('[aria-label]').forEach(el => {
         const lbl = el.getAttribute('aria-label') || '';
@@ -54,22 +45,20 @@ _EXTRACT_JS = """
         if (m) phone = m[0].trim();
     }
 
-    let site = siteEl ? (siteEl.href || siteEl.getAttribute('href') || '') : '';
-
     return {
-        name:         nameEl   ? nameEl.innerText.trim()         : '',
-        website:      site,
+        name:         nameEl ? nameEl.innerText.trim() : '',
+        website:      siteEl ? (siteEl.href || siteEl.getAttribute('href') || '') : '',
         category:     catEls.length ? catEls[0].innerText.trim() : '',
-        address:      addrEl   ? addrEl.innerText.trim()         : '',
+        address:      addrEl ? addrEl.innerText.trim() : '',
         phone:        phone,
-        rating:       ratingEl ? ratingEl.innerText.trim()       : '',
-        review_count: reviewEl ? reviewEl.innerText.replace(/[()]/g,'').trim() : '',
+        rating:       ratingEl ? ratingEl.innerText.trim() : '',
+        review_count: reviewEl ? reviewEl.innerText.replace(/[()]/g, '').trim() : '',
     };
 }).filter(r => r.name);
 """
 
 
-def _build_queries(keywords: list[str], location: str) -> list[str]:
+def build_queries(keywords: list[str], location: str) -> list[str]:
     queries = []
     for kw in keywords:
         queries.append(f"{kw} {location}")
@@ -78,21 +67,19 @@ def _build_queries(keywords: list[str], location: str) -> list[str]:
     return queries
 
 
-def _clean_url(href: str) -> str:
-    """Unwrap Google redirect URLs and strip tracking params."""
+def clean_url(href: str) -> str:
+    """Unwrap Google's redirect and drop the tracking query string."""
     if not href:
         return ""
-    # Google wraps outbound links: /url?q=https://example.com&...
     m = re.search(r"[?&]q=(https?://[^&]+)", href)
     if m:
         href = m.group(1)
-    # Drop query strings Google appends to business websites
     if "?" in href and "google" not in href:
         href = href.split("?")[0]
     return href.strip().rstrip("/")
 
 
-async def _dismiss_consent(page: Page) -> None:
+async def dismiss_consent(page: Page) -> None:
     for sel in (
         'button:has-text("Accept all")',
         'button:has-text("Accept")',
@@ -106,8 +93,8 @@ async def _dismiss_consent(page: Page) -> None:
             pass
 
 
-async def _scroll_to_load(page: Page, times: int = 15) -> None:
-    """Scroll the results feed to trigger lazy-loading."""
+async def scroll_to_load(page: Page, times: int = 15) -> None:
+    """Scroll the results feed so Google loads more cards."""
     try:
         feed = page.locator('div[role="feed"]')
         for _ in range(times):
@@ -117,7 +104,7 @@ async def _scroll_to_load(page: Page, times: int = 15) -> None:
         pass
 
 
-async def _scrape_query(page: Page, query: str, limit: int) -> list[dict]:
+async def scrape_query(page: Page, query: str, limit: int) -> list[dict]:
     url = f"https://www.google.com/maps/search/{quote(query)}"
     logger.info(f"[google_maps] {url}")
 
@@ -128,74 +115,58 @@ async def _scrape_query(page: Page, query: str, limit: int) -> list[dict]:
         logger.warning(f"[google_maps] load failed: {e}")
         return []
 
-    await _dismiss_consent(page)
-    await _scroll_to_load(page, times=15)
+    await dismiss_consent(page)
+    await scroll_to_load(page)
 
-    # Single JS call reads all cards — no per-card Playwright interaction
-    raw = await page.evaluate(_EXTRACT_JS)
-    logger.info(f"[google_maps] {len(raw)} cards in list view for '{query}'")
+    raw = await page.evaluate(EXTRACT_JS)
+    logger.info(f"[google_maps] {len(raw)} cards for '{query}'")
 
     results = []
     for item in raw:
         if len(results) >= limit:
             break
-        name    = item.get("name", "").strip()
-        website = _clean_url(item.get("website", ""))
+        name = item.get("name", "").strip()
         if not name:
             continue
         results.append({
             "company_name": name,
-            "website":      website,
-            "location":     item.get("address", "").strip(),
-            "category":     item.get("category", "").strip(),
-            "phone":        item.get("phone", "").strip(),
-            "rating":       item.get("rating", "").strip(),
+            "website": clean_url(item.get("website", "")),
+            "location": item.get("address", "").strip(),
+            "category": item.get("category", "").strip(),
+            "phone": item.get("phone", "").strip(),
+            "rating": item.get("rating", "").strip(),
             "review_count": item.get("review_count", "").strip(),
-            "source":       "google_maps",
+            "source": "google_maps",
         })
-
     return results
 
 
 async def scrape(keywords: list[str], location: str, limit: int) -> list[dict]:
-    """
-    Scrape Google Maps list view for each keyword/location combination.
+    """Run every keyword and location query and return up to `limit` leads.
 
-    Args:
-        keywords: list of search terms, e.g. ["plumbing", "HVAC"]
-        location: target city/state, e.g. "Utah"
-        limit:    max total raw leads to return
-
-    Returns:
-        List of lead dicts: company_name, website, location, category, source
+    Drives the installed Chrome headless. Leads are deduped by name here so
+    the same business from three query variants counts once.
     """
     results: list[dict] = []
     seen: set[str] = set()
-    queries = _build_queries(keywords, location)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, channel="chrome")
-        context = await browser.new_context(
-            user_agent=_USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-        )
+        context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 900})
         await context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
         page = await context.new_page()
 
-        for query in queries:
+        for query in build_queries(keywords, location):
             if len(results) >= limit:
                 break
-
-            batch = await _scrape_query(page, query, limit - len(results))
-            for lead in batch:
+            for lead in await scrape_query(page, query, limit - len(results)):
                 key = lead["company_name"].lower()
                 if key not in seen:
                     seen.add(key)
                     results.append(lead)
-
             await asyncio.sleep(1.0)
 
         await browser.close()
 
-    logger.info(f"[google_maps] total scraped: {len(results)}")
+    logger.info(f"[google_maps] {len(results)} leads scraped")
     return results

@@ -1,11 +1,9 @@
 """
-Bing organic search scraper using Playwright.
+Scrape Bing web results. Used with --no-maps or when Google Maps fails.
 
-Used when --no-maps is passed (no Google Maps needed).
-
-Key implementation detail: Bing wraps every outbound href in a bing.com/ck/a
-redirect. The real URL lives in the <cite> element (e.g. "site.com › path").
-We extract the domain from there and construct a clean https:// URL.
+Bing wraps every result link in a bing.com/ck/a redirect, so the href is
+useless. The real domain is in the <cite> element as "site.com > path", and
+I rebuild a clean https URL from that.
 """
 
 import asyncio
@@ -13,17 +11,18 @@ import logging
 import re
 from urllib.parse import quote
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import Page, async_playwright
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = (
+USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/121.0.0.0 Safari/537.36"
 )
 
-_SKIP_RE = re.compile(
+# Directories, social sites, and Bing itself. Never a lead.
+SKIP_RE = re.compile(
     r"(yelp\.com|angi\.com|angieslist|thumbtack|houzz|homeadvisor|"
     r"yellowpages|bbb\.org|manta\.com|expertise\.com|bark\.com|porch\.com|"
     r"groupon|facebook|instagram|linkedin|twitter|x\.com|reddit|youtube|"
@@ -33,12 +32,19 @@ _SKIP_RE = re.compile(
     re.I,
 )
 
+# Reads each result's title, cite, and snippet. Direct DOM access is more
+# reliable than locators on Bing's rendered results.
+EXTRACT_JS = """() =>
+    Array.from(document.querySelectorAll('li.b_algo')).map(el => ({
+        title:   (el.querySelector('h2 a') || {}).innerText || '',
+        cite:    (el.querySelector('cite') || {}).innerText || '',
+        snippet: (el.querySelector('.b_caption p') || {}).innerText || '',
+    }))
+"""
 
-def _build_queries(keywords: list[str], location: str) -> list[str]:
-    """
-    Generate varied queries per keyword to maximise result coverage.
-    Avoids over-quoting which kills Bing result volume.
-    """
+
+def build_queries(keywords: list[str], location: str) -> list[str]:
+    """Three plain phrasings per keyword. Quoting terms cuts Bing's result count too far."""
     queries = []
     for kw in keywords:
         queries.append(f"{kw} {location}")
@@ -47,17 +53,11 @@ def _build_queries(keywords: list[str], location: str) -> list[str]:
     return queries
 
 
-def _url_from_cite(cite_text: str) -> str:
-    """
-    Turn 'https://example.com › path › page' into 'https://example.com'.
-    Bing cite text may or may not include the scheme.
-    """
+def url_from_cite(cite_text: str) -> str:
+    """Turn "https://example.com › path › page" into "https://example.com"."""
     if not cite_text:
         return ""
-    # Grab everything before the first › separator
-    base = cite_text.split("›")[0].strip()
-    # Strip trailing slash
-    base = base.rstrip("/")
+    base = cite_text.split("›")[0].strip().rstrip("/")
     if not base:
         return ""
     if not base.startswith(("http://", "https://")):
@@ -65,11 +65,7 @@ def _url_from_cite(cite_text: str) -> str:
     return base
 
 
-def _is_junk(url: str) -> bool:
-    return bool(_SKIP_RE.search(url))
-
-
-async def _search_one(page: Page, query: str) -> list[dict]:
+async def search_one(page: Page, query: str) -> list[dict]:
     url = f"https://www.bing.com/search?q={quote(query)}&count=20&setlang=en-US"
     logger.info(f"[bing] {query}")
 
@@ -80,70 +76,46 @@ async def _search_one(page: Page, query: str) -> list[dict]:
         logger.warning(f"[bing] load failed: {e}")
         return []
 
-    # Use evaluate() — direct DOM access is more reliable than Playwright locators
-    # for Bing's dynamically rendered results.
-    data = await page.evaluate("""() =>
-        Array.from(document.querySelectorAll('li.b_algo')).map(el => ({
-            title:   (el.querySelector('h2 a')       || {}).innerText || '',
-            cite:    (el.querySelector('cite')        || {}).innerText || '',
-            snippet: (el.querySelector('.b_caption p')|| {}).innerText || '',
-        }))
-    """)
-
     results = []
-    for item in data:
-        title   = (item.get("title") or "").strip()
-        cite    = (item.get("cite")  or "").strip()
-        snippet = (item.get("snippet") or "").strip()
-
-        website = _url_from_cite(cite)
-        if not website or _is_junk(website):
+    for item in await page.evaluate(EXTRACT_JS):
+        website = url_from_cite((item.get("cite") or "").strip())
+        if not website or SKIP_RE.search(website):
             continue
-
         results.append({
-            "company_name": title,
-            "website":      website,
-            "location":     "",
-            "category":     "",
-            "source":       "bing",
-            "_snippet":     snippet,
+            "company_name": (item.get("title") or "").strip(),
+            "website": website,
+            "location": "",
+            "category": "",
+            "source": "bing",
+            "_snippet": (item.get("snippet") or "").strip(),
         })
 
-    logger.info(f"[bing] got {len(results)} usable results for: {query}")
+    logger.info(f"[bing] {len(results)} usable results for: {query}")
     return results
 
 
 async def scrape(keywords: list[str], location: str, limit: int) -> list[dict]:
-    """
-    Scrape Bing organic results for each keyword/location combination.
-
-    Returns list of lead dicts with keys:
-    company_name, website, location, category, source
-    """
+    """Run every keyword and location query and return up to `limit` leads, deduped by URL."""
     results: list[dict] = []
     seen: set[str] = set()
-    queries = _build_queries(keywords, location)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, channel="chrome")
-        page    = await browser.new_page(user_agent=_USER_AGENT)
+        page = await browser.new_page(user_agent=USER_AGENT)
 
-        for query in queries:
+        for query in build_queries(keywords, location):
             if len(results) >= limit:
                 break
-
-            batch = await _search_one(page, query)
-            for lead in batch:
+            for lead in await search_one(page, query):
                 key = lead["website"].lower().rstrip("/")
                 if key not in seen:
                     seen.add(key)
                     results.append(lead)
                     if len(results) >= limit:
                         break
-
             await asyncio.sleep(1.0)
 
         await browser.close()
 
-    logger.info(f"[bing] total scraped: {len(results)}")
+    logger.info(f"[bing] {len(results)} leads scraped")
     return results

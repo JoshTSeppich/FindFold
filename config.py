@@ -1,40 +1,35 @@
 """
-FoxWorks Lead Pipeline — central configuration.
+All the knobs in one place: paths, thresholds, keyword lists, and scoring weights.
 
-Tune ICP scoring weights, thresholds, and keyword lists here.
-Set ANTHROPIC_API_KEY in .env to enable Claude re-scoring.
+The keyword lists are what I tune when the pipeline runs on a new industry.
+Set ANTHROPIC_API_KEY in .env to turn on Claude rescoring.
 """
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Output paths
-# ---------------------------------------------------------------------------
+# Paths
 OUTPUT_DIR = Path("output")
-CACHE_DIR  = Path(".cache")
+CACHE_DIR = Path(".cache")
 
-RAW_OUTPUT         = OUTPUT_DIR / "raw_leads.csv"
-FILTERED_OUTPUT    = OUTPUT_DIR / "filtered_leads.csv"
-APOLLO_OUTPUT      = OUTPUT_DIR / "apollo_ready.csv"
-OUTREACH_OUTPUT    = OUTPUT_DIR / "outreach_ready.csv"
-SEEN_DOMAINS_FILE  = OUTPUT_DIR / "seen_domains.json"
+RAW_OUTPUT = OUTPUT_DIR / "raw_leads.csv"
+FILTERED_OUTPUT = OUTPUT_DIR / "filtered_leads.csv"
+APOLLO_OUTPUT = OUTPUT_DIR / "apollo_ready.csv"
+OUTREACH_OUTPUT = OUTPUT_DIR / "outreach_ready.csv"
+SEEN_DOMAINS_FILE = OUTPUT_DIR / "seen_domains.json"
 
-# ---------------------------------------------------------------------------
-# ICP threshold — keyword-scored leads below this are dropped before Claude
-# ---------------------------------------------------------------------------
-ICP_THRESHOLD = 0.55   # slightly lower than before; Claude handles the 0.55-0.70 band
+# Keyword scoring. A lead below this score is dropped, unless Claude is on and
+# the score is still inside the ambiguous band below.
+ICP_THRESHOLD = 0.55
 
-# ---------------------------------------------------------------------------
-# Claude API — re-scores leads in the ambiguous zone
-# ---------------------------------------------------------------------------
-CLAUDE_MODEL          = "claude-haiku-4-5-20251001"   # cheapest, fastest
-CLAUDE_AMBIGUOUS_MIN  = 0.40   # keyword score floor for Claude review
-CLAUDE_AMBIGUOUS_MAX  = 0.72   # keyword score ceiling for Claude review
-CLAUDE_CONCURRENCY    = 5      # parallel Claude requests
-CLAUDE_FINAL_THRESHOLD = 0.60  # minimum Claude score to pass
+# Claude rescoring. Only leads whose keyword score lands in this band go to
+# Claude. Its score replaces the keyword score, and the lead must then clear
+# CLAUDE_FINAL_THRESHOLD.
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+CLAUDE_AMBIGUOUS_MIN = 0.40
+CLAUDE_AMBIGUOUS_MAX = 0.72
+CLAUDE_CONCURRENCY = 5
+CLAUDE_FINAL_THRESHOLD = 0.60
 
-# ---------------------------------------------------------------------------
-# Directory / marketplace domains — always excluded
-# ---------------------------------------------------------------------------
+# Directories and marketplaces. Never a customer.
 DIRECTORY_DOMAINS = {
     "yelp.com", "angi.com", "angieslist.com", "thumbtack.com",
     "houzz.com", "homeadvisor.com", "yellowpages.com", "bbb.org",
@@ -50,9 +45,7 @@ DIRECTORY_DOMAINS = {
     "tripadvisor.com", "trustpilot.com", "chamber.com",
 }
 
-# ---------------------------------------------------------------------------
-# National franchise / chain domains — hard-excluded (not SMBs)
-# ---------------------------------------------------------------------------
+# National chains and franchises. Not small businesses, so not customers.
 FRANCHISE_DOMAINS = {
     "rotorooter.com", "mrrooterutah.com", "mrrooter.com",
     "servpro.com", "servicemaster.com", "belfor.com",
@@ -66,7 +59,7 @@ FRANCHISE_DOMAINS = {
     "heartlanddental.com", "dentalcare.com",
 }
 
-# Franchise name signals — catches unlisted chains by brand name
+# Brand names that mark a franchise even when the domain is not listed above.
 FRANCHISE_NAME_SIGNALS = [
     "roto-rooter", "mr. rooter", "mr rooter",
     "servpro", "service master", "servicemaster",
@@ -80,9 +73,7 @@ FRANCHISE_NAME_SIGNALS = [
     "orangetheory", "planet fitness", "anytime fitness",
 ]
 
-# ---------------------------------------------------------------------------
-# ICP signal keyword lists
-# ---------------------------------------------------------------------------
+# Phrases that show a business takes inbound work.
 BOOKING_INTENT_PHRASES = [
     "free estimate", "free quote", "instant quote",
     "call now", "call today", "call us",
@@ -93,6 +84,7 @@ BOOKING_INTENT_PHRASES = [
     "schedule a call", "24/7", "same day", "emergency service",
 ]
 
+# Phrases small local businesses use about themselves.
 TRUST_PHRASES = [
     "family owned", "family-owned", "family run",
     "locally owned", "locally-owned", "local",
@@ -104,6 +96,7 @@ TRUST_PHRASES = [
     "no job too small",
 ]
 
+# Phrases that mark a company as too big.
 ENTERPRISE_SIGNALS = [
     " platform", "enterprise", "global ",
     " api ", " saas ", " b2b ",
@@ -115,6 +108,7 @@ ENTERPRISE_SIGNALS = [
     "50+ locations", "100+ locations",
 ]
 
+# Phrases that mark a directory rather than a business.
 DIRECTORY_SIGNALS = [
     "find a ", "search for ", "compare ",
     "get quotes from", "thousands of pros",
@@ -123,6 +117,7 @@ DIRECTORY_SIGNALS = [
     "read reviews", "top rated pros near",
 ]
 
+# Two or more of these and the page is mostly a careers page.
 CAREER_SIGNALS = [
     "we're hiring", "join our team",
     "open positions", "job openings",
@@ -130,9 +125,8 @@ CAREER_SIGNALS = [
     "view all jobs",
 ]
 
-# ---------------------------------------------------------------------------
-# Industry keyword groups
-# ---------------------------------------------------------------------------
+# Industry groups. A lead gets the keyword_match weight if its text or the
+# search keywords match any phrase in any group.
 INDUSTRY_KEYWORDS = {
     "home_services": [
         "plumbing", "plumber", "hvac", "heating", "cooling", "air conditioning",
@@ -167,29 +161,24 @@ INDUSTRY_KEYWORDS = {
     ],
 }
 
-# ---------------------------------------------------------------------------
-# Scoring weights
-# ---------------------------------------------------------------------------
+# Scoring weights. Positives add up to 0.95, and a good review score adds
+# 0.05 on top. The franchise penalty alone is enough to drop a lead.
 SCORE_WEIGHTS = {
-    # Positive signals
-    "keyword_match":          0.20,
-    "location_match":         0.20,
-    "has_website":            0.15,
+    "keyword_match": 0.20,
+    "location_match": 0.20,
+    "has_website": 0.15,
     "has_contact_indicators": 0.15,
-    "booking_intent":         0.15,
-    "trust_signals":          0.10,
-    # Negative penalties
-    "franchise":             -0.90,   # hard kill
-    "directory":             -0.50,
-    "enterprise":            -0.40,
-    "careers_heavy":         -0.30,
+    "booking_intent": 0.15,
+    "trust_signals": 0.10,
+    "franchise": -0.90,
+    "directory": -0.50,
+    "enterprise": -0.40,
+    "careers_heavy": -0.30,
 }
 
-# ---------------------------------------------------------------------------
-# HTTP / concurrency / cache settings
-# ---------------------------------------------------------------------------
-REQUEST_TIMEOUT     = 15     # seconds per request
-MAX_RETRIES         = 3      # attempts before giving up
-RETRY_DELAY         = 1.5    # seconds between retries (× attempt number)
-CONCURRENT_REQUESTS = 15     # parallel website scans (bumped for 500-lead runs)
-CACHE_TTL_DAYS      = 30     # expire cached pages after this many days
+# Fetching and caching.
+REQUEST_TIMEOUT = 15        # seconds per request
+MAX_RETRIES = 3
+RETRY_DELAY = 1.5           # seconds, doubled on each retry after the first
+CONCURRENT_REQUESTS = 15    # homepages fetched at once
+CACHE_TTL_DAYS = 30         # cached pages older than this are fetched again

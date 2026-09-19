@@ -1,57 +1,49 @@
 """
-FoxWorks Lead Pipeline — CLI entry point.
+Command-line entry point for FindFold.
 
 Usage:
-    python main.py --keywords "plumbing,HVAC,roofing,med spa" \
-                   --location "Utah" \
-                   --limit 300
+    python main.py --keywords "plumbing,HVAC,roofing,med spa" --location "Utah" --limit 300
 
-    # Multiple cities (parallel scraping):
-    python main.py --keywords "HVAC,roofing,med spa" \
-                   --cities "Salt Lake City Utah,Provo Utah,Ogden Utah" \
-                   --limit 100
+    # Several cities. Each city gets an even share of --limit.
+    python main.py --keywords "HVAC,roofing" --cities "Salt Lake City Utah,Provo Utah" --limit 100
 
-    # Skip Google Maps (faster, no Playwright needed):
+    # Skip Google Maps and use Bing only.
     python main.py --keywords "plumbing,HVAC" --location "Utah" --no-maps
 
-    # Clean run — ignore cross-run dedup:
+    # Ignore the seen-domains list and process everything again.
     python main.py --keywords "plumbing,HVAC" --location "Utah" --fresh
 
-    # Re-process domains seen more than 90 days ago:
-    python main.py --keywords "plumbing,HVAC" --location "Utah" \
-                   --unseen-older-than 90
+    # Process again any domain first seen more than 90 days ago.
+    python main.py --keywords "plumbing,HVAC" --location "Utah" --unseen-older-than 90
 
-Outputs written to ./output/:
-    raw_leads.csv       — everything scraped, unfiltered
-    filtered_leads.csv  — ICP-scored leads above threshold
-    apollo_ready.csv    — minimal 2-column CSV for Apollo bulk enrichment
-    outreach_ready.csv  — full scoring data for outreach sequences
+Files written to output/:
+    raw_leads.csv        everything scraped, before any filtering
+    filtered_leads.csv   leads that passed scoring, with all fields
+    apollo_ready.csv     company_name and domain only, for Apollo bulk enrichment
+    outreach_ready.csv   scores, contact fields, and tags for outreach tools
 """
 
 import asyncio
 import csv
 import logging
+import os
 import sys
 from pathlib import Path
 
 import click
 from dotenv import load_dotenv
+from rich import box
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
-from rich import box
 
 load_dotenv()
 
 import config
-from lead_pipeline.scraper  import scrape_google_maps, scrape_duckduckgo
-from lead_pipeline.filter   import deduplicate, filter_leads, rescore_ambiguous, filter_new, save_seen
-from lead_pipeline.scanner  import fetch_many, extract
-from lead_pipeline.export   import export_apollo, export_outreach
-
-# ---------------------------------------------------------------------------
-# Console + logging
-# ---------------------------------------------------------------------------
+from lead_pipeline.export import export_apollo, export_outreach
+from lead_pipeline.filter import deduplicate, filter_leads, filter_new, rescore_ambiguous, save_seen
+from lead_pipeline.scanner import extract, fetch_many
+from lead_pipeline.scraper import scrape_bing, scrape_google_maps
 
 console = Console()
 
@@ -63,17 +55,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline")
 
-
-# ---------------------------------------------------------------------------
-# CSV helpers
-# ---------------------------------------------------------------------------
-
-_RAW_FIELDS = [
+RAW_FIELDS = [
     "company_name", "website", "location", "category", "source",
     "phone", "rating", "review_count",
 ]
 
-_FILTERED_FIELDS = [
+FILTERED_FIELDS = [
     "company_name", "domain", "location", "category",
     "icp_score", "claude_score", "reason_tags",
     "phone", "email", "rating", "review_count",
@@ -81,7 +68,7 @@ _FILTERED_FIELDS = [
 ]
 
 
-def _save_csv(rows: list[dict], path: Path, fields: list[str]) -> None:
+def save_csv(rows: list[dict], path: Path, fields: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -89,251 +76,184 @@ def _save_csv(rows: list[dict], path: Path, fields: list[str]) -> None:
         writer.writerows(rows)
 
 
-# ---------------------------------------------------------------------------
-# Rich summary table (top-20 leads)
-# ---------------------------------------------------------------------------
-
-def _print_table(leads: list[dict]) -> None:
+def print_top_leads(leads: list[dict]) -> None:
+    """Print the twenty best leads as a table."""
     top = sorted(leads, key=lambda x: x.get("icp_score", 0), reverse=True)[:20]
 
-    table = Table(
-        title="Top ICP Leads",
-        box=box.SIMPLE_HEAD,
-        show_header=True,
-        header_style="bold cyan",
-    )
-    table.add_column("Company",  max_width=32, no_wrap=True)
-    table.add_column("Domain",   max_width=26, no_wrap=True)
-    table.add_column("Score",    justify="right", style="bold green", width=6)
-    table.add_column("Claude",   justify="right", style="bold yellow", width=7)
-    table.add_column("Tags",     max_width=38)
+    table = Table(title="Top leads", box=box.SIMPLE_HEAD, header_style="bold cyan")
+    table.add_column("Company", max_width=32, no_wrap=True)
+    table.add_column("Domain", max_width=26, no_wrap=True)
+    table.add_column("Score", justify="right", style="bold green", width=6)
+    table.add_column("Claude", justify="right", style="bold yellow", width=7)
+    table.add_column("Tags", max_width=38)
 
     for lead in top:
         claude_score = lead.get("claude_score")
-        claude_str   = f"{claude_score:.2f}" if claude_score is not None else "—"
         table.add_row(
             lead.get("company_name", "")[:32],
-            lead.get("domain",       "")[:26],
+            lead.get("domain", "")[:26],
             f"{lead.get('icp_score', 0):.2f}",
-            claude_str,
-            lead.get("reason_tags",  ""),
+            f"{claude_score:.2f}" if claude_score is not None else "",
+            lead.get("reason_tags", ""),
         )
 
     console.print()
     console.print(table)
 
 
-# ---------------------------------------------------------------------------
-# Scraping — supports multiple cities
-# ---------------------------------------------------------------------------
-
-async def _scrape_city(
-    keywords: list[str],
-    location: str,
-    limit: int,
-    use_maps: bool,
-) -> list[dict]:
-    """Scrape one city. Falls back to Bing if Maps fails."""
+async def scrape_city(keywords: list[str], location: str, limit: int, use_maps: bool) -> list[dict]:
+    """Scrape one city. If Google Maps fails, fall back to Bing."""
     if use_maps:
         try:
             return await scrape_google_maps(keywords, location, limit)
         except Exception as e:
             logger.warning(f"[{location}] Maps failed ({e}). Falling back to Bing.")
-    return await scrape_duckduckgo(keywords, location, limit)
+    return await scrape_bing(keywords, location, limit)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline stages
-# ---------------------------------------------------------------------------
+def shared_location(locations: list[str]) -> str:
+    """Return the words all locations share, so scoring matches the region rather than one city.
+
+    ["Salt Lake City Utah", "Provo Utah"] gives "Utah".
+    """
+    if len(locations) == 1:
+        return locations[0]
+    word_sets = [set(loc.split()) for loc in locations]
+    common = word_sets[0].intersection(*word_sets[1:])
+    return " ".join(w for w in locations[0].split() if w in common) or locations[0]
+
 
 async def run_pipeline(
-    keywords:           list[str],
-    locations:          list[str],
-    limit:              int,
-    use_maps:           bool,
-    fresh:              bool,
-    unseen_older_than:  int,
+    keywords: list[str],
+    locations: list[str],
+    limit: int,
+    use_maps: bool,
+    fresh: bool,
+    unseen_older_than: int,
 ) -> None:
-
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Stage 1: Scrape ───────────────────────────────────────────────────
-    console.rule("[bold blue]Stage 1 · Scraping")
+    # Stage 1: scrape.
+    console.rule("[bold blue]Stage 1: scrape")
 
     per_city_limit = max(1, limit // len(locations))
-    src_label = "Bing only" if not use_maps else "Google Maps (Bing fallback)"
-    console.print(
-        f"  Source   : {src_label}\n"
-        f"  Cities   : {len(locations)}\n"
-        f"  Per-city : {per_city_limit} raw leads"
-    )
+    source = "Google Maps, Bing fallback" if use_maps else "Bing only"
+    console.print(f"  Source: {source}\n  Cities: {len(locations)}\n  Per city: {per_city_limit} raw leads")
 
-    # Cities run sequentially to avoid Google Maps rate-limiting from
-    # multiple parallel Playwright browser instances on the same machine.
-    # Bing/no-maps mode can be parallelised safely if needed.
+    # Cities run one at a time. Several Playwright browsers hitting Google Maps
+    # from one machine get rate limited.
     raw_leads: list[dict] = []
     for loc in locations:
-        batch = await _scrape_city(keywords, loc, per_city_limit, use_maps)
-        raw_leads.extend(batch)
+        raw_leads.extend(await scrape_city(keywords, loc, per_city_limit, use_maps))
 
     if not raw_leads:
-        console.print("[bold red]No raw leads scraped. Check your keywords/location.")
+        console.print("[bold red]No leads scraped. Check the keywords and location.")
         sys.exit(1)
 
-    _save_csv(raw_leads, config.RAW_OUTPUT, _RAW_FIELDS)
-    console.print(f"  [green]✓[/] {len(raw_leads)} raw leads → [dim]{config.RAW_OUTPUT}[/]")
+    save_csv(raw_leads, config.RAW_OUTPUT, RAW_FIELDS)
+    console.print(f"  {len(raw_leads)} raw leads written to {config.RAW_OUTPUT}")
 
-    # ── Stage 2: Deduplicate ──────────────────────────────────────────────
-    console.rule("[bold blue]Stage 2 · Deduplication")
+    # Stage 2: remove duplicates within this run.
+    console.rule("[bold blue]Stage 2: dedupe")
 
     deduped = deduplicate(raw_leads)
-    console.print(f"  [green]✓[/] {len(raw_leads)} → {len(deduped)} after dedup")
+    console.print(f"  {len(raw_leads)} leads, {len(deduped)} after dedupe")
 
-    # ── Stage 3: Website scanning ─────────────────────────────────────────
-    console.rule("[bold blue]Stage 3 · Website Scanning")
+    # Stage 3: fetch each homepage and pull out the text we score on.
+    console.rule("[bold blue]Stage 3: scan websites")
 
-    scannable = [
-        lead["website"]
-        for lead in deduped
-        if (lead.get("website") or "").strip()
-    ]
-    console.print(
-        f"  Scanning {len(scannable)} sites "
-        f"(concurrency={config.CONCURRENT_REQUESTS}) …"
-    )
+    urls = [lead["website"] for lead in deduped if (lead.get("website") or "").strip()]
+    console.print(f"  Fetching {len(urls)} sites, {config.CONCURRENT_REQUESTS} at a time")
 
-    html_map = await fetch_many(scannable, concurrency=config.CONCURRENT_REQUESTS)
+    html_by_url = await fetch_many(urls, concurrency=config.CONCURRENT_REQUESTS)
 
     scanned = 0
     for lead in deduped:
-        url = (lead.get("website") or "").strip()
-        html = html_map.get(url)
+        html = html_by_url.get((lead.get("website") or "").strip())
         if html:
             lead.update(extract(html))
             scanned += 1
 
-    console.print(f"  [green]✓[/] {scanned}/{len(scannable)} pages scanned")
+    console.print(f"  {scanned} of {len(urls)} pages scanned")
 
-    # ── Stage 4: ICP scoring + filtering ─────────────────────────────────
-    console.rule("[bold blue]Stage 4 · ICP Scoring & Filtering")
+    # Stage 4: keyword scoring.
+    # With a Claude key present I keep everything down to the ambiguous floor,
+    # because Claude gets the final say on that band. Without a key the keyword
+    # threshold is final.
+    console.rule("[bold blue]Stage 4: keyword scoring")
 
-    # Use the shared geographic term across all locations for scoring
-    # e.g. ["Salt Lake City Utah", "Provo Utah"] → "Utah"
-    if len(locations) == 1:
-        score_location = locations[0]
-    else:
-        words_sets = [set(loc.split()) for loc in locations]
-        common = words_sets[0].intersection(*words_sets[1:])
-        score_location = " ".join(w for w in locations[0].split() if w in common) or locations[0]
+    use_claude = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+    threshold = min(config.ICP_THRESHOLD, config.CLAUDE_AMBIGUOUS_MIN) if use_claude else config.ICP_THRESHOLD
 
-    filtered = filter_leads(deduped, score_location, keywords)
-    console.print(
-        f"  [green]✓[/] {len(filtered)} keyword-qualified leads "
-        f"(≥{config.ICP_THRESHOLD})"
+    filtered = filter_leads(deduped, shared_location(locations), keywords, threshold=threshold)
+    console.print(f"  {len(filtered)} leads scored at or above {threshold}")
+
+    # Stage 5: Claude rescoring for the ambiguous band only.
+    console.rule("[bold blue]Stage 5: Claude rescoring")
+
+    ambiguous = sum(
+        1 for lead in filtered
+        if config.CLAUDE_AMBIGUOUS_MIN <= lead.get("icp_score", 0) <= config.CLAUDE_AMBIGUOUS_MAX
     )
-
-    # ── Stage 4b: Claude ambiguous-zone rescoring ─────────────────────────
-    console.rule("[bold blue]Stage 4b · Claude Rescoring")
-
-    ambiguous_count = sum(
-        1 for l in filtered
-        if config.CLAUDE_AMBIGUOUS_MIN <= l.get("icp_score", 0) <= config.CLAUDE_AMBIGUOUS_MAX
-    )
-    if ambiguous_count:
-        console.print(f"  Rescoring {ambiguous_count} ambiguous leads with Claude …")
+    if ambiguous and use_claude:
+        console.print(f"  Sending {ambiguous} ambiguous leads to Claude")
         filtered = await rescore_ambiguous(filtered)
-        console.print(f"  [green]✓[/] {len(filtered)} leads after Claude rescoring")
+        console.print(f"  {len(filtered)} leads after Claude")
+    elif ambiguous:
+        console.print("  No ANTHROPIC_API_KEY set, keyword scores are final")
     else:
-        console.print("  No ambiguous leads — Claude rescoring skipped")
+        console.print("  No ambiguous leads, nothing to rescore")
 
-    # ── Stage 4c: Cross-run domain dedup ─────────────────────────────────
-    console.rule("[bold blue]Stage 4c · Cross-Run Deduplication")
+    # Stage 6: drop domains already sent to Apollo in an earlier run.
+    console.rule("[bold blue]Stage 6: cross-run dedupe")
 
-    filtered, seen_dict = filter_new(
-        filtered,
-        fresh=fresh,
-        unseen_older_than=unseen_older_than,
-    )
-    console.print(f"  [green]✓[/] {len(filtered)} new domains (not previously sent to Apollo)")
+    filtered, seen = filter_new(filtered, fresh=fresh, unseen_older_than=unseen_older_than)
+    console.print(f"  {len(filtered)} domains not sent to Apollo before")
 
-    _save_csv(filtered, config.FILTERED_OUTPUT, _FILTERED_FIELDS)
-    console.print(f"  [dim]→ {config.FILTERED_OUTPUT}[/]")
+    save_csv(filtered, config.FILTERED_OUTPUT, FILTERED_FIELDS)
+    console.print(f"  Written to {config.FILTERED_OUTPUT}")
 
-    # ── Stage 5: Export ───────────────────────────────────────────────────
-    console.rule("[bold blue]Stage 5 · Export")
+    # Stage 7: export.
+    console.rule("[bold blue]Stage 7: export")
 
-    apollo_n   = export_apollo(filtered,   config.APOLLO_OUTPUT)
-    outreach_n = export_outreach(filtered, config.OUTREACH_OUTPUT)
+    apollo_rows = export_apollo(filtered, config.APOLLO_OUTPUT)
+    outreach_rows = export_outreach(filtered, config.OUTREACH_OUTPUT)
 
-    # Save seen domains ONLY after both exports succeed.
-    # This prevents leads from being permanently skipped if an export fails.
-    if apollo_n > 0 and outreach_n > 0:
-        save_seen(seen_dict)
-        console.print(f"  [green]✓[/] Seen domains persisted ({len(seen_dict)} total)")
+    # Only record domains as seen once both exports are on disk. If an export
+    # fails, the leads come back next run instead of being lost.
+    if apollo_rows > 0 and outreach_rows > 0:
+        save_seen(seen)
+        console.print(f"  Seen domains saved, {len(seen)} total")
     elif filtered:
-        console.print(
-            "[yellow]  ⚠ Export produced 0 rows — seen domains NOT saved "
-            "(leads will be re-processed next run)[/]"
-        )
+        console.print("[yellow]  An export wrote 0 rows, so seen domains were not saved. These leads will run again next time.")
 
-    console.print(f"  [green]✓[/] Apollo:   {apollo_n} rows → [dim]{config.APOLLO_OUTPUT}[/]")
-    console.print(f"  [green]✓[/] Outreach: {outreach_n} rows → [dim]{config.OUTREACH_OUTPUT}[/]")
+    console.print(f"  Apollo: {apollo_rows} rows in {config.APOLLO_OUTPUT}")
+    console.print(f"  Outreach: {outreach_rows} rows in {config.OUTREACH_OUTPUT}")
 
-    # ── Summary ───────────────────────────────────────────────────────────
-    console.rule("[bold green]Pipeline Complete")
+    console.rule("[bold green]Done")
 
-    _print_table(filtered)
+    print_top_leads(filtered)
 
     console.print()
-    console.print(f"  Raw scraped:    [bold]{len(raw_leads)}[/]")
-    console.print(f"  After dedup:    [bold]{len(deduped)}[/]")
-    console.print(f"  Pages scanned:  [bold]{scanned}[/]")
-    console.print(f"  ICP qualified:  [bold cyan]{len(filtered)}[/]")
-
+    console.print(f"  Raw scraped: [bold]{len(raw_leads)}[/]")
+    console.print(f"  After dedupe: [bold]{len(deduped)}[/]")
+    console.print(f"  Pages scanned: [bold]{scanned}[/]")
+    console.print(f"  Qualified: [bold cyan]{len(filtered)}[/]")
     if filtered:
-        ratio = len(raw_leads) / len(filtered)
-        console.print(f"  Filter ratio:   [bold]{ratio:.1f}x[/] (raw → qualified)")
+        console.print(f"  Raw to qualified: [bold]{len(raw_leads) / len(filtered):.1f}x[/]")
     console.print()
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 @click.command()
-@click.option(
-    "--keywords", required=True,
-    help='Comma-separated ICP keywords. E.g. "plumbing,HVAC,roofing,med spa"',
-)
-@click.option(
-    "--location", default="",
-    help='Single target market. E.g. "Salt Lake City Utah". Ignored if --cities is set.',
-)
-@click.option(
-    "--cities", default="",
-    help='Comma-separated cities to scrape. E.g. "Salt Lake City Utah,Provo Utah"',
-)
-@click.option(
-    "--limit", default=300, show_default=True,
-    help="Max raw leads to scrape (split evenly across cities).",
-)
-@click.option(
-    "--no-maps", is_flag=True, default=False,
-    help="Skip Google Maps; use Bing only (faster, no Playwright needed).",
-)
-@click.option(
-    "--fresh", is_flag=True, default=False,
-    help="Ignore seen-domains list — re-process all leads (clean run).",
-)
-@click.option(
-    "--unseen-older-than", "unseen_older_than", default=0, show_default=True,
-    help="Re-process domains first seen more than N days ago (0 = never expire).",
-)
-@click.option(
-    "--debug", is_flag=True, default=False,
-    help="Enable DEBUG-level logging.",
-)
+@click.option("--keywords", required=True, help='Comma-separated search terms, e.g. "plumbing,HVAC,roofing".')
+@click.option("--location", default="", help='One market, e.g. "Salt Lake City Utah". Ignored when --cities is set.')
+@click.option("--cities", default="", help='Comma-separated cities, e.g. "Salt Lake City Utah,Provo Utah".')
+@click.option("--limit", default=300, show_default=True, help="Max raw leads to scrape, split evenly across cities.")
+@click.option("--no-maps", is_flag=True, default=False, help="Skip Google Maps and use Bing only.")
+@click.option("--fresh", is_flag=True, default=False, help="Ignore the seen-domains list and process every lead again.")
+@click.option("--unseen-older-than", "unseen_older_than", default=0, show_default=True, help="Process again any domain first seen more than N days ago. 0 means never.")
+@click.option("--debug", is_flag=True, default=False, help="Log at DEBUG level.")
 def main(
     keywords: str,
     location: str,
@@ -344,46 +264,42 @@ def main(
     unseen_older_than: int,
     debug: bool,
 ) -> None:
-    """FoxWorks Lead Pipeline — scrape, score, and export ICP leads for Apollo."""
-
+    """Scrape local businesses, score them against the Foxworks customer profile, and export CSVs for Apollo."""
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
     keyword_list = [k.strip() for k in keywords.split(",") if k.strip()]
     if not keyword_list:
-        console.print("[red]Error: at least one keyword is required.")
+        console.print("[red]At least one keyword is required.")
         sys.exit(1)
 
-    # --cities takes precedence over --location
     if cities:
         location_list = [c.strip() for c in cities.split(",") if c.strip()]
     elif location:
         location_list = [location.strip()]
     else:
-        console.print("[red]Error: provide --location or --cities.")
+        console.print("[red]Give --location or --cities.")
         sys.exit(1)
 
     console.print()
-    console.print("[bold cyan]FoxWorks Lead Pipeline[/]")
-    console.print(f"  Keywords : {keyword_list}")
-    console.print(f"  Cities   : {location_list}")
-    console.print(f"  Limit    : {limit} raw leads total")
-    console.print(
-        f"  Source   : {'Bing only' if no_maps else 'Google Maps (Bing fallback)'}"
-    )
-    console.print(f"  Fresh    : {'yes (ignoring seen domains)' if fresh else 'no'}")
+    console.print("[bold cyan]FindFold[/]")
+    console.print(f"  Keywords: {keyword_list}")
+    console.print(f"  Cities: {location_list}")
+    console.print(f"  Limit: {limit} raw leads total")
+    console.print(f"  Source: {'Bing only' if no_maps else 'Google Maps, Bing fallback'}")
+    console.print(f"  Fresh: {'yes, ignoring seen domains' if fresh else 'no'}")
     if unseen_older_than:
-        console.print(f"  Expiry   : re-process domains older than {unseen_older_than} days")
-    console.print(f"  Output   : {config.OUTPUT_DIR}/")
+        console.print(f"  Expiry: process again domains older than {unseen_older_than} days")
+    console.print(f"  Output: {config.OUTPUT_DIR}/")
     console.print()
 
     asyncio.run(run_pipeline(
-        keywords          = keyword_list,
-        locations         = location_list,
-        limit             = limit,
-        use_maps          = not no_maps,
-        fresh             = fresh,
-        unseen_older_than = unseen_older_than,
+        keywords=keyword_list,
+        locations=location_list,
+        limit=limit,
+        use_maps=not no_maps,
+        fresh=fresh,
+        unseen_older_than=unseen_older_than,
     ))
 
 

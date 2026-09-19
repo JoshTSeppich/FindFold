@@ -1,12 +1,9 @@
 """
-Cross-run domain deduplication.
+Remember which domains have already gone to Apollo.
 
-Persists a JSON file (output/seen_domains.json) that tracks every domain
-we've already sent to Apollo. On subsequent runs, these domains are skipped
-so Apollo is never billed twice for the same enrichment.
-
-Use --fresh to ignore the seen list for a clean run.
-Use --unseen-older-than N to re-process domains first seen more than N days ago.
+output/seen_domains.json maps each domain to the date it was first exported.
+Later runs skip those domains so Apollo never bills the same enrichment twice.
+--fresh ignores the file. --unseen-older-than N lets domains back in after N days.
 """
 
 import json
@@ -22,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 def load(path: Path = SEEN_DOMAINS_FILE) -> dict[str, str]:
-    """Load seen domains from disk. Returns {domain: first_seen_date}."""
     if not path.exists():
         return {}
     try:
@@ -33,13 +29,9 @@ def load(path: Path = SEEN_DOMAINS_FILE) -> dict[str, str]:
 
 
 def save(seen: dict[str, str], path: Path = SEEN_DOMAINS_FILE) -> None:
-    """
-    Atomically persist seen domains to disk.
-    Writes to a temp file then renames to avoid corruption on partial writes.
-    """
+    """Write to a temp file and rename, so a crash mid-write cannot corrupt the list."""
     if not seen:
         return
-    # Drop invalid (empty) keys before saving
     clean = {k: v for k, v in seen.items() if k and k.strip()}
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -47,7 +39,7 @@ def save(seen: dict[str, str], path: Path = SEEN_DOMAINS_FILE) -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(json.dumps(clean, indent=2, sort_keys=True))
-            os.replace(tmp, path)   # atomic on POSIX and Windows 10+
+            os.replace(tmp, path)
         except Exception:
             os.unlink(tmp)
             raise
@@ -60,61 +52,42 @@ def filter_new(
     fresh: bool = False,
     unseen_older_than: int = 0,
 ) -> tuple[list[dict], dict[str, str]]:
-    """
-    Remove leads whose domain has already been processed.
+    """Drop leads whose domain was exported before.
 
-    Args:
-        leads:             ICP-qualified leads (must have 'domain' field)
-        fresh:             if True, ignore the seen list (return all leads)
-        unseen_older_than: if > 0, re-admit domains first seen more than this
-                           many days ago (useful for periodic re-enrichment)
-
-    Returns:
-        (new_leads, seen_dict)  — seen_dict includes both old and new domains
+    Returns the new leads and the updated seen map, which includes the new
+    domains stamped with today. The caller saves the map once the exports
+    are on disk.
     """
     if fresh:
         seen: dict[str, str] = {}
-        logger.info("[seen_domains] --fresh: ignoring seen domains")
+        logger.info("[seen_domains] --fresh, ignoring seen domains")
     else:
         seen = load()
-        logger.info(f"[seen_domains] {len(seen)} previously seen domains loaded")
+        logger.info(f"[seen_domains] {len(seen)} domains seen before")
 
-    # Apply expiry if requested
     if unseen_older_than > 0 and seen:
-        cutoff     = date.today() - timedelta(days=unseen_older_than)
-        cutoff_str = str(cutoff)
-        before     = len(seen)
-        seen = {
-            domain: dt for domain, dt in seen.items()
-            if dt >= cutoff_str
-        }
-        removed = before - len(seen)
-        if removed:
-            logger.info(
-                f"[seen_domains] {removed} domains expired "
-                f"(older than {unseen_older_than} days)"
-            )
+        cutoff = str(date.today() - timedelta(days=unseen_older_than))
+        before = len(seen)
+        seen = {domain: dt for domain, dt in seen.items() if dt >= cutoff}
+        if before - len(seen):
+            logger.info(f"[seen_domains] {before - len(seen)} domains older than {unseen_older_than} days let back in")
 
-    new_leads:  list[dict] = []
-    today_str:  str        = str(date.today())
-    duplicates: int        = 0
+    new_leads: list[dict] = []
+    today = str(date.today())
+    skipped = 0
 
     for lead in leads:
         domain = (lead.get("domain") or "").strip().lower()
         if not domain:
             continue
         if domain in seen:
-            duplicates += 1
-            logger.debug(f"[seen_domains] skip (seen {seen[domain]}): {domain}")
+            skipped += 1
+            logger.debug(f"[seen_domains] skip {domain}, seen {seen[domain]}")
         else:
-            seen[domain] = today_str
+            seen[domain] = today
             new_leads.append(lead)
 
-    if duplicates:
-        logger.info(
-            f"[seen_domains] {duplicates} already-seen domains skipped "
-            f"(saves Apollo enrichment cost)"
-        )
-
-    logger.info(f"[seen_domains] {len(new_leads)} new domains to export")
+    if skipped:
+        logger.info(f"[seen_domains] {skipped} domains skipped, already sent to Apollo")
+    logger.info(f"[seen_domains] {len(new_leads)} new domains")
     return new_leads, seen

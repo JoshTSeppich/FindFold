@@ -1,69 +1,51 @@
 """
-Deduplication utilities.
+Remove duplicate leads within one run.
 
-Normalizes raw URLs to bare domains, then keeps the most complete
-record for each domain. Leads without a website are grouped by
-lowercased company name to avoid silently discarding them before
-the ICP scorer has a chance to drop them explicitly.
-
-When merging duplicates, the version WITH a website always beats
-the version without, regardless of other field completeness.
+Leads with a website are keyed by bare domain. Leads without one are keyed
+by company name so they survive to the scorer, which drops them with a
+reason instead of losing them silently here. When two records share a key,
+the one with a website wins, then the one with more fields filled in.
 """
 
 import logging
 import re
-from typing import Optional
 
 import tldextract
 
 logger = logging.getLogger(__name__)
 
-# Strip common legal suffixes before name-based dedup
-_LEGAL_SUFFIX_RE = re.compile(
+LEGAL_SUFFIX_RE = re.compile(
     r"\s*(,?\s*(llc|inc|corp|co|ltd|lp|plc|pllc|dba|s\.a\.|p\.a\.)\.?\s*$)",
     re.IGNORECASE,
 )
 
 
 def normalize_domain(url: str) -> str:
-    """
-    Extract a clean, normalized domain from any URL string.
+    """Reduce any URL to its registrable domain, or "" if there is none.
 
-    Examples:
-        "https://www.bestplumbing.com/services" → "bestplumbing.com"
-        "http://abc.co.uk"                      → "abc.co.uk"
-        "not a url"                             → ""
-
-    Returns empty string if no valid registrable domain is found.
+    "https://www.bestplumbing.com/services" gives "bestplumbing.com".
+    "http://abc.co.uk" gives "abc.co.uk".
     """
     if not url or not url.strip():
         return ""
-
     url = url.strip()
-    # tldextract handles scheme-less URLs but is more reliable with one
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-
     ext = tldextract.extract(url)
     if not ext.domain or not ext.suffix:
         return ""
-
     return f"{ext.domain}.{ext.suffix}".lower()
 
 
-def _normalize_name(name: str) -> str:
-    """Strip legal suffixes and extra whitespace for company-name dedup."""
-    return _LEGAL_SUFFIX_RE.sub("", name).strip().lower()
+def normalize_name(name: str) -> str:
+    return LEGAL_SUFFIX_RE.sub("", name).strip().lower()
 
 
-def _completeness(lead: dict) -> int:
-    """
-    Score a lead by populated fields. Website presence gets extra weight
-    so the version with a website always wins when merging duplicates.
-    """
+def completeness(lead: dict) -> int:
+    """Count filled fields. A website counts for ten so it always wins."""
     score = 0
     if str(lead.get("website", "")).strip():
-        score += 10   # heavy bonus — website is the most valuable field
+        score += 10
     for f in ("location", "category", "company_name", "phone", "rating"):
         if str(lead.get(f, "")).strip():
             score += 1
@@ -71,34 +53,16 @@ def _completeness(lead: dict) -> int:
 
 
 def deduplicate(leads: list[dict]) -> list[dict]:
-    """
-    Remove duplicate leads, keeping the most complete record per domain.
-
-    Deduplication key:
-      - Leads WITH a website  → normalized domain
-      - Leads WITHOUT website → "__nosite__" + normalized company name
-
-    Returns deduplicated list preserving insertion order of first-seen keys.
-    """
+    """Keep one record per domain, or per company name when there is no domain."""
     by_key: dict[str, dict] = {}
 
     for lead in leads:
-        website = str(lead.get("website", "")).strip()
-        domain  = normalize_domain(website)
+        domain = normalize_domain(str(lead.get("website", "")).strip())
+        key = domain or "__nosite__" + normalize_name(str(lead.get("company_name", "")))
 
-        if domain:
-            key = domain
-        else:
-            name = _normalize_name(str(lead.get("company_name", "")))
-            key  = f"__nosite__{name}"
-
-        if key not in by_key:
+        if key not in by_key or completeness(lead) > completeness(by_key[key]):
             by_key[key] = lead
-        else:
-            # Prefer the lead with higher completeness (website presence wins)
-            if _completeness(lead) > _completeness(by_key[key]):
-                by_key[key] = lead
 
     result = list(by_key.values())
-    logger.info(f"[dedup] {len(leads)} → {len(result)} leads")
+    logger.info(f"[dedup] {len(leads)} in, {len(result)} out")
     return result

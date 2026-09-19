@@ -1,14 +1,10 @@
 """
-Async HTTP fetcher with retry logic and disk-based caching.
+Fetch homepages, many at a time, with retries and a disk cache.
 
-Design:
-  - aiohttp for async HTTP (fast, non-blocking)
-  - asyncio.Semaphore to cap concurrent connections
-  - Simple MD5-keyed file cache to avoid re-fetching across runs
-  - Immediate first retry on transient failures, then exponential backoff
-  - SSL: attempts with verification first; retries without on SSLError only
-    (many small business sites have expired/misconfigured certificates)
-  - TCPConnector limit matches semaphore concurrency (no wasted FDs)
+Pages are cached under .cache/ keyed by the MD5 of the URL and expire after
+CACHE_TTL_DAYS. The first retry is immediate and later ones back off. Many
+small business sites have broken certificates, so a certificate error gets
+one more try with verification off. A 4xx is treated as final.
 """
 
 import asyncio
@@ -22,40 +18,35 @@ from typing import Optional
 import aiohttp
 
 from config import (
-    REQUEST_TIMEOUT,
-    MAX_RETRIES,
-    RETRY_DELAY,
     CACHE_DIR,
-    CONCURRENT_REQUESTS,
     CACHE_TTL_DAYS,
+    CONCURRENT_REQUESTS,
+    MAX_RETRIES,
+    REQUEST_TIMEOUT,
+    RETRY_DELAY,
 )
 
 logger = logging.getLogger(__name__)
 
-_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/121.0.0.0 Safari/537.36"
     ),
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
-    "Connection":      "keep-alive",
+    "Connection": "keep-alive",
 }
 
 
-# ---------------------------------------------------------------------------
-# Cache helpers
-# ---------------------------------------------------------------------------
-
-def _cache_path(url: str) -> Path:
-    h = hashlib.md5(url.encode()).hexdigest()
-    return CACHE_DIR / f"{h}.html"
+def cache_path(url: str) -> Path:
+    return CACHE_DIR / f"{hashlib.md5(url.encode()).hexdigest()}.html"
 
 
-def _read_cache(url: str) -> Optional[str]:
-    p = _cache_path(url)
+def read_cache(url: str) -> Optional[str]:
+    p = cache_path(url)
     if not p.exists():
         return None
     age_days = (time.time() - p.stat().st_mtime) / 86400
@@ -63,7 +54,7 @@ def _read_cache(url: str) -> Optional[str]:
         try:
             p.unlink()
         except FileNotFoundError:
-            pass   # already removed by concurrent process
+            pass
         return None
     try:
         return p.read_text(encoding="utf-8", errors="ignore")
@@ -71,37 +62,21 @@ def _read_cache(url: str) -> Optional[str]:
         return None
 
 
-def _write_cache(url: str, html: str) -> None:
+def write_cache(url: str, html: str) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        _cache_path(url).write_text(html, encoding="utf-8", errors="ignore")
+        cache_path(url).write_text(html, encoding="utf-8", errors="ignore")
     except Exception:
         pass
 
 
-# ---------------------------------------------------------------------------
-# Single-URL fetch
-# ---------------------------------------------------------------------------
-
-async def fetch_html(
-    session: aiohttp.ClientSession,
-    url: str,
-    use_cache: bool = True,
-) -> Optional[str]:
-    """
-    Fetch the homepage HTML for `url`.
-
-    Returns the HTML string, or None if all attempts fail.
-    Caches successful responses to disk.
-
-    SSL strategy: try with verification; on SSLError retry without.
-    4xx responses are not retried (permanent failures).
-    """
+async def fetch_html(session: aiohttp.ClientSession, url: str, use_cache: bool = True) -> Optional[str]:
+    """Return the page HTML, or None when every attempt fails."""
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
     if use_cache:
-        cached = _read_cache(url)
+        cached = read_cache(url)
         if cached:
             logger.debug(f"[scanner] cache hit: {url}")
             return cached
@@ -112,85 +87,60 @@ async def fetch_html(
         try:
             async with session.get(
                 url,
-                headers=_HEADERS,
-                timeout=aiohttp.ClientTimeout(
-                    total=REQUEST_TIMEOUT,
-                    sock_connect=10,
-                    sock_read=REQUEST_TIMEOUT,
-                ),
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT, sock_connect=10, sock_read=REQUEST_TIMEOUT),
                 allow_redirects=True,
                 ssl=ssl_ctx,
             ) as resp:
-                # 4xx = permanent failure, don't retry
                 if resp.status >= 400:
                     logger.debug(f"[scanner] HTTP {resp.status}: {url}")
                     return None
-
                 html = await resp.text(errors="ignore")
-
                 if use_cache:
-                    _write_cache(url, html)
-
+                    write_cache(url, html)
                 return html
 
         except aiohttp.ClientConnectorCertificateError:
-            # SSL cert problem — retry immediately without verification
             if ssl_ctx is not False:
-                logger.debug(f"[scanner] SSL error, retrying without verify: {url}")
+                logger.debug(f"[scanner] certificate error, retrying without verification: {url}")
                 ssl_ctx = False
-                continue   # don't count as an attempt
+                continue
         except asyncio.TimeoutError:
-            logger.debug(f"[scanner] timeout (attempt {attempt}): {url}")
-        except aiohttp.ClientConnectorError as e:
-            logger.debug(f"[scanner] connect error (attempt {attempt}): {url} — {e}")
+            logger.debug(f"[scanner] timeout, attempt {attempt}: {url}")
         except aiohttp.ClientError as e:
-            logger.debug(f"[scanner] client error (attempt {attempt}): {url} — {e}")
+            logger.debug(f"[scanner] client error, attempt {attempt}: {url}: {e}")
         except Exception as e:
-            logger.debug(f"[scanner] unexpected (attempt {attempt}): {url} — {e}")
+            logger.debug(f"[scanner] error, attempt {attempt}: {url}: {e}")
 
-        if attempt < MAX_RETRIES:
-            # Immediate first retry; exponential backoff after that
-            if attempt > 1:
-                await asyncio.sleep(RETRY_DELAY * (2 ** (attempt - 2)))
+        if 1 < attempt < MAX_RETRIES:
+            await asyncio.sleep(RETRY_DELAY * (2 ** (attempt - 2)))
 
     logger.debug(f"[scanner] gave up: {url}")
     return None
 
-
-# ---------------------------------------------------------------------------
-# Batch fetch (concurrent)
-# ---------------------------------------------------------------------------
 
 async def fetch_many(
     urls: list[str],
     concurrency: int = CONCURRENT_REQUESTS,
     use_cache: bool = True,
 ) -> dict[str, Optional[str]]:
-    """
-    Fetch multiple URLs concurrently up to `concurrency` at a time.
-
-    Returns:
-        dict mapping original url → html string (or None on failure)
-    """
+    """Fetch every URL, at most `concurrency` at once. Returns url to html, None on failure."""
     results: dict[str, Optional[str]] = {}
     semaphore = asyncio.Semaphore(concurrency)
 
-    # Match connector limit to semaphore — no wasted file descriptors
     connector = aiohttp.TCPConnector(limit=concurrency)
     async with aiohttp.ClientSession(connector=connector) as session:
 
-        async def _one(url: str) -> None:
+        async def one(url: str) -> None:
             async with semaphore:
                 results[url] = await fetch_html(session, url, use_cache=use_cache)
 
-        tasks = [asyncio.create_task(_one(url)) for url in urls]
-        completed = 0
-        total     = len(tasks)
-
+        tasks = [asyncio.create_task(one(url)) for url in urls]
+        done = 0
         for coro in asyncio.as_completed(tasks):
             await coro
-            completed += 1
-            if completed % 20 == 0 or completed == total:
-                logger.info(f"[scanner] {completed}/{total} pages fetched")
+            done += 1
+            if done % 20 == 0 or done == len(tasks):
+                logger.info(f"[scanner] {done}/{len(tasks)} pages fetched")
 
     return results
