@@ -41,7 +41,7 @@ load_dotenv()
 
 import config
 from lead_pipeline.export import export_apollo, export_outreach
-from lead_pipeline.filter import deduplicate, filter_leads, filter_new, rescore_ambiguous, save_seen
+from lead_pipeline.filter import band_decision, deduplicate, filter_leads, filter_new, rescore_ambiguous, save_seen
 from lead_pipeline.scanner import extract, fetch_many
 from lead_pipeline.scraper import scrape_bing, scrape_google_maps
 
@@ -192,10 +192,7 @@ async def run_pipeline(
     # Stage 5: Claude rescoring for the ambiguous band only.
     console.rule("[bold blue]Stage 5: Claude rescoring")
 
-    ambiguous = sum(
-        1 for lead in filtered
-        if config.CLAUDE_AMBIGUOUS_MIN <= lead.get("icp_score", 0) <= config.CLAUDE_AMBIGUOUS_MAX
-    )
+    ambiguous = sum(1 for lead in filtered if band_decision(lead.get("icp_score", 0)) == "ask")
     if ambiguous and use_claude:
         console.print(f"  Sending {ambiguous} ambiguous leads to Claude")
         filtered = await rescore_ambiguous(filtered)

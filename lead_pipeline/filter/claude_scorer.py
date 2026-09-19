@@ -139,6 +139,26 @@ async def score_batch(client, batch: list[dict], sem: asyncio.Semaphore) -> None
             logger.warning(f"[claude] batch error: {e}")
 
 
+def band_decision(
+    score: float,
+    *,
+    ambiguous_min: float = CLAUDE_AMBIGUOUS_MIN,
+    ambiguous_max: float = CLAUDE_AMBIGUOUS_MAX,
+) -> str:
+    """Where a keyword score lands relative to the ambiguous band.
+
+    Returns "drop" below the band, "ask" inside it (inclusive at both ends),
+    and "accept" above it. This is the one place the threshold rule lives, and
+    it is pure so the rule can be tested without a network. Only "ask" leads
+    ever cost a model call.
+    """
+    if score > ambiguous_max:
+        return "accept"
+    if score >= ambiguous_min:
+        return "ask"
+    return "drop"
+
+
 def keyword_threshold_only(leads: list[dict]) -> list[dict]:
     return [lead for lead in leads if lead.get("icp_score", 0) >= ICP_THRESHOLD]
 
@@ -160,11 +180,8 @@ async def rescore_ambiguous(leads: list[dict]) -> list[dict]:
         logger.warning("[claude] anthropic package not installed, keyword scores are final")
         return keyword_threshold_only(leads)
 
-    ambiguous = [
-        lead for lead in leads
-        if CLAUDE_AMBIGUOUS_MIN <= lead.get("icp_score", 0) <= CLAUDE_AMBIGUOUS_MAX
-    ]
-    clear_pass = [lead for lead in leads if lead.get("icp_score", 0) > CLAUDE_AMBIGUOUS_MAX]
+    ambiguous = [lead for lead in leads if band_decision(lead.get("icp_score", 0)) == "ask"]
+    clear_pass = [lead for lead in leads if band_decision(lead.get("icp_score", 0)) == "accept"]
 
     if not ambiguous:
         logger.info("[claude] no ambiguous leads")

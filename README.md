@@ -6,7 +6,7 @@ FindFold is a command-line pipeline I built to find local service businesses tha
 
 ## Status
 
-Working. There are no automated tests. The scrapers drive the installed Google Chrome through Playwright, so Chrome must be present, and the sites being scraped can change their markup at any time.
+Working. A small pytest suite covers the scoring band: a lead below the band never reaches Claude, one inside it does, and one above it is accepted without a model call (`pip install pytest && pytest`). The scrapers have no tests. They drive the installed Google Chrome through Playwright, so Chrome must be present, and the sites being scraped can change their markup at any time.
 
 ## Run it
 
