@@ -2,7 +2,7 @@
 # The scrapers drive the Chrome you already have installed, so there is no
 # separate browser download step.
 
-aiohttp==3.9.1
+aiohttp==3.14.3
 playwright==1.40.0
 beautifulsoup4==4.12.2
 lxml>=4.9.4
